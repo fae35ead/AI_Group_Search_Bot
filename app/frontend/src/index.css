@@ -1,0 +1,81 @@
+:root {
+  --page-bg: #f4efe3;
+  --page-bg-alt: #f8f3e8;
+  --surface: rgba(255, 255, 255, 0.92);
+  --border: rgba(61, 74, 66, 0.16);
+  --text: #556254;
+  --heading: #1d2a24;
+  --muted: #728170;
+  --accent-soft: #dfeee0;
+  --accent-strong: #2d6a43;
+  --code-bg: rgba(237, 239, 230, 0.92);
+
+  --sans: 'Aptos', 'Trebuchet MS', sans-serif;
+  --display: 'Georgia', 'Times New Roman', serif;
+  --mono: 'Cascadia Code', Consolas, monospace;
+
+  font: 18px/1.6 var(--sans);
+  letter-spacing: 0.01em;
+  color: var(--text);
+  background:
+    radial-gradient(circle at top, rgba(214, 229, 217, 0.68), transparent 32%),
+    linear-gradient(180deg, var(--page-bg), var(--page-bg-alt));
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  width: min(1180px, 100%);
+  margin: 0 auto;
+  min-height: 100svh;
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+h1,
+h2 {
+  margin: 0;
+  color: var(--heading);
+}
+
+h1 {
+  font-family: var(--display);
+  font-size: clamp(2.8rem, 7vw, 4.8rem);
+  line-height: 0.94;
+  letter-spacing: -0.04em;
+}
+
+h2 {
+  font-size: 1.35rem;
+  line-height: 1.2;
+}
+
+p {
+  margin: 0;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+code {
+  display: inline-flex;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: var(--code-bg);
+  font-family: var(--mono);
+  font-size: 0.9rem;
+  line-height: 1.35;
+  color: var(--heading);
+}
+
+* {
+  box-sizing: border-box;
+}

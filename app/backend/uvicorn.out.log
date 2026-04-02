@@ -1,0 +1,24 @@
+INFO:     127.0.0.1:63690 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50642 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50643 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65438 - "POST /api/search HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51738 - "POST /api/search HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61339 - "POST /api/search HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61352 - "POST /api/search HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52983 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52984 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52985 - "POST /api/search HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53297 - "POST /api/search HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60278 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60279 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60280 - "POST /api/search HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61729 - "POST /api/search HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61756 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64119 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64120 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64122 - "POST /api/search HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58431 - "POST /api/search HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54994 - "POST /api/search HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53811 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53811 - "GET /favicon.ico HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:53811 - "GET /api/health HTTP/1.1" 200 OK
