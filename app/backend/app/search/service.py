@@ -13,6 +13,7 @@ from app.api.schemas import ProductCard
 from app.core.config import Settings
 from app.search.entry_extractor import EntryExtractor
 from app.search.models import (
+  CandidatePageSummary,
   DiscoveredTargets,
   DiscoveryCandidateSummary,
   DiscoveryTrace,
@@ -57,6 +58,7 @@ class SearchService:
       normalized.cleaned_query,
       normalized.domain,
       trace.discovery,
+      normalized.explicit_repo_url,
     )
 
     if targets is None:
@@ -71,6 +73,19 @@ class SearchService:
       return [], trace
 
     groups = self.extractor.extract(pages, trace.extraction)
+
+    if not groups and targets.official_site_url:
+      seen_page_urls = {page.final_url for page in pages}
+      fallback_pages = self._fetch_official_site_search_pages(
+        targets,
+        seen_page_urls,
+        trace.fetch,
+      )
+
+      if fallback_pages:
+        pages.extend(fallback_pages)
+        groups = self.extractor.extract(fallback_pages, trace.extraction)
+
     github_metadata = self._fetch_github_metadata(targets.github_repo_url)
     description = self._pick_description(pages, github_metadata)
 
@@ -98,7 +113,32 @@ class SearchService:
     cleaned_query: str,
     domain: str | None,
     trace: DiscoveryTrace | None = None,
+    explicit_repo_url: str | None = None,
   ) -> DiscoveredTargets | None:
+    # Case: user passed a full GitHub repo URL — use it directly as github_repo_url
+    if explicit_repo_url:
+      app_name = cleaned_query  # repo name is already extracted by SearchEntry
+
+      # Try to fetch github metadata to discover homepage (official site)
+      github_meta = self._fetch_github_metadata(explicit_repo_url)
+      official_site_url: str | None = None  # homepage discovered via GitHub API below
+
+      if github_meta:
+        # homepage field is the official site URL provided by the repo owner
+        official_site_url = self._normalize_homepage(github_meta.homepage) if hasattr(github_meta, 'homepage') else None
+
+      if trace is not None:
+        trace.official_site_url = official_site_url
+        trace.official_site_reason = 'from-github-repo-homepage'
+        trace.github_repo_url = explicit_repo_url
+        trace.github_repo_reason = 'explicit-github-repo-url'
+
+      return DiscoveredTargets(
+        app_name=app_name,
+        official_site_url=official_site_url,
+        github_repo_url=explicit_repo_url,
+      )
+
     if domain:
       official_site_url = f'https://{domain}'
       app_name = self._title_from_domain(domain)
@@ -121,7 +161,7 @@ class SearchService:
         github_repo_url=github_candidate.repo_url if github_candidate else None,
       )
 
-    official_results = self._search_web(f'{cleaned_query} official site')
+    official_results = self._search_multi_variants(cleaned_query)
     github_candidate, github_summary = self._search_github_repository(cleaned_query)
     (
       official_site_url,
@@ -129,6 +169,23 @@ class SearchService:
       supplemental_urls,
       candidate_summaries,
     ) = self._select_official_site(cleaned_query, official_results, github_candidate)
+
+    # PRD §3: GitHub is an official source — when GitHub found a candidate but
+    # homepage is empty AND web search found nothing, use the repo/owner name
+    # to Bing-search for the official website. This ensures we still crawl the
+    # official site and have a chance at finding QR codes, not just return a
+    # product card with no groups.
+    if official_site_url is None and github_candidate is not None:
+      bing_fallback_results = self._search_web(github_candidate.full_name)
+      if bing_fallback_results:
+        (
+          official_site_url,
+          official_site_reason,
+          supplemental_urls,
+          candidate_summaries,
+        ) = self._select_official_site(cleaned_query, bing_fallback_results, github_candidate)
+        if trace is not None:
+          trace.official_site_reason = f'github-bing-fallback({official_site_reason})'
 
     if trace is not None:
       trace.web_candidates = candidate_summaries
@@ -230,6 +287,20 @@ class SearchService:
       if url not in filtered_supplemental_urls:
         filtered_supplemental_urls.append(url)
 
+    alternate_official_roots = [
+      candidate.url
+      for candidate in candidate_summaries
+      if (
+        candidate.url != selected.url
+        and self._is_root_path(candidate.url)
+        and 'brand-domain-near-exact' in candidate.reasons
+      )
+    ]
+
+    for url in alternate_official_roots:
+      if url not in filtered_supplemental_urls:
+        filtered_supplemental_urls.append(url)
+
     return (
       selected.url,
       ', '.join(selected.reasons),
@@ -253,6 +324,7 @@ class SearchService:
     fetched_pages = []
     seen: set[str] = set()
     seed_urls: list[str] = []
+    max_pages = 12
 
     if targets.official_site_url:
       seed_urls.append(targets.official_site_url)
@@ -262,6 +334,9 @@ class SearchService:
         seed_urls.append(url)
 
     for seed_url in seed_urls:
+      if len(fetched_pages) >= max_pages:
+        break
+
       page = self.page_fetcher.fetch_page(seed_url)
 
       if not page or page.final_url in seen:
@@ -269,11 +344,7 @@ class SearchService:
 
       if (
         seed_url != targets.official_site_url
-        and not self.validator.is_official_url(
-          page.final_url,
-          targets.official_site_url,
-          targets.github_repo_url,
-        )
+        and not self._is_allowed_official_url(page.final_url, targets)
       ):
         continue
 
@@ -281,47 +352,58 @@ class SearchService:
       fetched_pages.append(page)
       self._record_fetched_page(page, trace)
 
-      internal_links = self.page_fetcher.collect_relevant_internal_links(page)
-
-      if trace is not None:
-        trace.internal_links[page.final_url] = internal_links
-
-      for link in internal_links:
-        if link in seen:
-          continue
-
-        linked_page = self.page_fetcher.fetch_page(link)
-
-        if not linked_page:
-          continue
-
-        if linked_page.final_url in seen:
-          continue
-
-        if not self.validator.is_official_url(
-          linked_page.final_url,
-          targets.official_site_url,
-          targets.github_repo_url,
-        ):
-          continue
-
-        seen.add(linked_page.final_url)
-        fetched_pages.append(linked_page)
-        self._record_fetched_page(linked_page, trace)
-
-        discovered_repo = self._discover_github_from_page(
-          linked_page.final_url,
-          linked_page.html,
-        )
-        if discovered_repo and targets.github_repo_url is None:
-          targets.github_repo_url = discovered_repo
-
     if targets.github_repo_url:
       github_page = self.page_fetcher.fetch_page(targets.github_repo_url)
 
-      if github_page and github_page.final_url not in seen:
+      if github_page and github_page.final_url not in seen and len(fetched_pages) < max_pages:
         fetched_pages.append(github_page)
         self._record_fetched_page(github_page, trace)
+        seen.add(github_page.final_url)
+
+        github_candidates = self._collect_candidate_pages(
+          [github_page],
+          targets,
+          trace,
+          depth_limit=2,
+        )
+        self._fetch_candidate_pages(
+          github_candidates,
+          targets,
+          seen,
+          trace,
+          max_pages=max_pages,
+          fetched_pages=fetched_pages,
+        )
+
+    first_layer_candidates = self._collect_candidate_pages(
+      fetched_pages,
+      targets,
+      trace,
+      depth_limit=8,
+    )
+    first_layer_pages = self._fetch_candidate_pages(
+      first_layer_candidates,
+      targets,
+      seen,
+      trace,
+      max_pages=max_pages,
+      fetched_pages=fetched_pages,
+    )
+
+    second_layer_candidates = self._collect_candidate_pages(
+      first_layer_pages,
+      targets,
+      trace,
+      depth_limit=4,
+    )
+    self._fetch_candidate_pages(
+      second_layer_candidates,
+      targets,
+      seen,
+      trace,
+      max_pages=max_pages,
+      fetched_pages=fetched_pages,
+    )
 
     return fetched_pages
 
@@ -341,6 +423,177 @@ class SearchService:
       ),
     )
 
+  def _collect_candidate_pages(
+    self,
+    pages: list,
+    targets: DiscoveredTargets,
+    trace: FetchTrace | None,
+    depth_limit: int,
+  ) -> list[CandidatePageSummary]:
+    candidates_by_url: dict[str, CandidatePageSummary] = {}
+
+    for page in pages:
+      per_page_limit = 2 if 'github.com' in urlparse(page.final_url).netloc.lower() else depth_limit
+      candidates = self.page_fetcher.discover_candidate_internal_links(
+        page,
+        limit=per_page_limit,
+      )
+
+      if trace is not None:
+        trace.internal_links[page.final_url] = [candidate.url for candidate in candidates]
+        trace.candidate_pages.extend(candidates)
+
+      for candidate in candidates:
+        if not self._is_allowed_official_url(candidate.url, targets):
+          continue
+
+        existing = candidates_by_url.get(candidate.url)
+        if existing is None or candidate.score > existing.score:
+          candidates_by_url[candidate.url] = candidate
+
+    return sorted(
+      candidates_by_url.values(),
+      key=lambda item: (item.score, -self._path_depth(item.url)),
+      reverse=True,
+    )
+
+  def _fetch_candidate_pages(
+    self,
+    candidates: list[CandidatePageSummary],
+    targets: DiscoveredTargets,
+    seen: set[str],
+    trace: FetchTrace | None,
+    max_pages: int,
+    fetched_pages: list,
+  ) -> list:
+    new_pages = []
+
+    for candidate in candidates:
+      if len(fetched_pages) >= max_pages:
+        break
+
+      if candidate.url in seen:
+        continue
+
+      linked_page = self.page_fetcher.fetch_page(candidate.url)
+
+      if not linked_page:
+        continue
+
+      if linked_page.final_url in seen:
+        continue
+
+      if not self._is_allowed_official_url(linked_page.final_url, targets):
+        continue
+
+      seen.add(linked_page.final_url)
+      fetched_pages.append(linked_page)
+      new_pages.append(linked_page)
+      self._record_fetched_page(linked_page, trace)
+
+      discovered_repo = self._discover_github_from_page(
+        linked_page.final_url,
+        linked_page.html,
+      )
+      if discovered_repo and targets.github_repo_url is None:
+        targets.github_repo_url = discovered_repo
+
+    return new_pages
+
+  def _fetch_official_site_search_pages(
+    self,
+    targets: DiscoveredTargets,
+    seen_page_urls: set[str],
+    trace: FetchTrace | None,
+  ) -> list:
+    if not targets.official_site_url:
+      return []
+
+    fallback_candidates: dict[str, CandidatePageSummary] = {}
+    fetched_pages = []
+    candidate_hosts = {
+      urlparse(targets.official_site_url).netloc.lower(),
+      *[urlparse(url).netloc.lower() for url in targets.supplemental_urls],
+    }
+
+    for host in sorted(filter(None, candidate_hosts)):
+      for query in self._build_site_search_queries(targets, host):
+        if trace is not None:
+          trace.site_search_queries.append(query)
+
+        for result in self._search_web(query):
+          if len(fetched_pages) >= 3:
+            return fetched_pages
+
+          if not self._is_allowed_official_url(result.url, targets):
+            continue
+
+          if result.url in seen_page_urls:
+            continue
+
+          score = self._score_site_search_result(
+            result,
+            targets.app_name,
+            targets.official_site_url,
+          )
+          candidate = CandidatePageSummary(
+            url=result.url,
+            score=score,
+            source_page=query,
+            source_type='site_search',
+            reasons=['site-search'],
+          )
+          existing = fallback_candidates.get(result.url)
+          if existing is None or candidate.score > existing.score:
+            fallback_candidates[result.url] = candidate
+
+    ordered_candidates = sorted(
+      fallback_candidates.values(),
+      key=lambda item: (item.score, -self._path_depth(item.url)),
+      reverse=True,
+    )
+
+    if trace is not None:
+      trace.candidate_pages.extend(ordered_candidates)
+
+    for candidate in ordered_candidates[:3]:
+      page = self.page_fetcher.fetch_page(candidate.url)
+      if not page or page.final_url in seen_page_urls:
+        continue
+      fetched_pages.append(page)
+      seen_page_urls.add(page.final_url)
+      self._record_fetched_page(page, trace)
+
+    return fetched_pages
+
+  def _build_site_search_queries(
+    self,
+    targets: DiscoveredTargets,
+    host: str,
+  ) -> list[str]:
+    host = host.removeprefix('www.')
+    brand = targets.app_name or self._title_from_domain(host)
+    return [
+      f'site:{host} {brand} 飞书',
+      f'site:{host} {brand} 开发者 社区',
+      f'site:{host} {brand} 二维码',
+      f'site:{host} {brand} 社群',
+    ]
+
+  def _score_site_search_result(
+    self,
+    result: SearchResultLink,
+    app_name: str,
+    official_site_url: str,
+  ) -> int:
+    summary = self._score_official_site_candidate(
+      app_name,
+      result,
+      source='site_search',
+      github_candidate=None,
+    )
+    return summary.score + 40
+
   def _search_web(self, query: str) -> list[SearchResultLink]:
     results = self._search_bing(query)
 
@@ -348,6 +601,31 @@ class SearchService:
       return results
 
     return self._search_duckduckgo(query)
+
+  def _search_multi_variants(self, query: str) -> list[SearchResultLink]:
+    """Search with multiple query variants to improve official-site discovery rate."""
+    variants = [
+      f'{query} official site',
+      f'{query} 官方群',
+      f'{query} 官网',
+      f'{query} github',
+    ]
+
+    all_results: list[SearchResultLink] = []
+    seen: set[str] = set()
+
+    for variant in variants:
+      results = self._search_web(variant)
+
+      for result in results:
+        if result.url not in seen:
+          seen.add(result.url)
+          all_results.append(result)
+
+      if len(all_results) >= 15:
+        break
+
+    return all_results
 
   def _search_bing(self, query: str) -> list[SearchResultLink]:
     try:
@@ -478,25 +756,52 @@ class SearchService:
         follow_redirects=True,
         timeout=self.settings.request_timeout_seconds,
       ) as client:
-        response = client.get(
-          'https://api.github.com/search/repositories',
-          params={
-            'q': f'{query} in:name',
-            'per_page': 10,
-            'sort': 'stars',
-            'order': 'desc',
-          },
-        )
-        response.raise_for_status()
+        # Search across name, description, and topics to maximize recall
+        # PRD §3: GitHub is an official source; broad search ensures product cards
+        # are returned even when repo name doesn't exactly match the query
+        search_queries = [
+          f'{query} in:name',
+          f'{query} in:description',
+          f'{query} in:topics',
+        ]
+
+        all_items: list[dict] = []
+        seen_full_names: set[str] = set()
+
+        for q in search_queries:
+          q_response = client.get(
+            'https://api.github.com/search/repositories',
+            params={
+              'q': q,
+              'per_page': 10,
+              'sort': 'stars',
+              'order': 'desc',
+            },
+          )
+          try:
+            q_response.raise_for_status()
+          except httpx.HTTPError:
+            continue
+
+          for item in q_response.json().get('items', []):
+            full_name = item.get('full_name', '')
+            if full_name and full_name not in seen_full_names:
+              seen_full_names.add(full_name)
+              all_items.append(item)
+
+          if len(all_items) >= 15:
+            break
     except httpx.HTTPError:
       return None, None
 
-    payload = response.json()
+    if not all_items:
+      return None, None
+
     best_candidate: GitHubRepositoryCandidate | None = None
     best_score = -999
     best_reasons: list[str] = []
 
-    for item in payload.get('items', []):
+    for item in all_items:
       repo_url = item.get('html_url')
       full_name = item.get('full_name')
       owner = item.get('owner') or {}
@@ -631,7 +936,7 @@ class SearchService:
   ) -> tuple[bool, list[str]]:
     reasons: list[str] = []
 
-    if score < 120:
+    if score < 80:
       reasons.append('score-below-confidence-threshold')
       return False, reasons
 
@@ -717,6 +1022,9 @@ class SearchService:
     if query_joined and brand_component == query_joined:
       score += 140
       reasons.append('brand-domain-exact')
+    elif query_joined and self._is_near_brand_match(brand_component, query_joined):
+      score += 95
+      reasons.append('brand-domain-near-exact')
     elif query_tokens and all(token in brand_tokens for token in query_tokens):
       score += 90
       reasons.append('brand-domain-token-match')
@@ -863,6 +1171,21 @@ class SearchService:
 
     return labels[0]
 
+  def _is_near_brand_match(self, brand_component: str, query_joined: str) -> bool:
+    if not brand_component or not query_joined:
+      return False
+
+    if brand_component == query_joined:
+      return False
+
+    if brand_component.startswith(query_joined) and len(brand_component) - len(query_joined) <= 1:
+      return True
+
+    if query_joined.startswith(brand_component) and len(query_joined) - len(brand_component) <= 1:
+      return True
+
+    return False
+
   def _is_root_path(self, url: str) -> bool:
     parsed = urlparse(url)
     return parsed.path in {'', '/'}
@@ -870,6 +1193,19 @@ class SearchService:
   def _path_depth(self, url: str) -> int:
     parsed = urlparse(url)
     return len([segment for segment in parsed.path.split('/') if segment])
+
+  def _is_allowed_official_url(self, url: str, targets: DiscoveredTargets) -> bool:
+    if self.validator.is_official_url(
+      url,
+      targets.official_site_url,
+      targets.github_repo_url,
+    ):
+      return True
+
+    return any(
+      self.validator.is_same_site(url, supplemental_url)
+      for supplemental_url in targets.supplemental_urls
+    )
 
   def _resolve_app_name(
     self,
@@ -968,6 +1304,7 @@ class SearchService:
       stars=payload.get('stargazers_count'),
       created_at=payload.get('created_at'),
       description=payload.get('description'),
+      homepage=payload.get('homepage'),
     )
 
   def _pick_description(

@@ -60,7 +60,11 @@ function App() {
 
     try {
       const response = await searchOfficialGroups(trimmed)
-      setResults(response.results)
+      // 去重：同一 productId 只保留第一张卡片
+      const unique = Array.from(
+        new Map(response.results.map((c) => [c.productId, c])).values(),
+      )
+      setResults(unique)
       setEmptyMessage(response.emptyMessage)
     } catch (error) {
       setResults([])
@@ -153,83 +157,111 @@ function App() {
 
           {!loading && !emptyMessage && results.length > 0 ? (
             <div className="results-grid">
-              {results.map((card) => (
-                <article className="panel result-card" key={card.productId}>
-                  <div className="card-header">
-                    <div>
-                      <p className="card-title">{card.appName}</p>
-                      <p className="card-description">
-                        {card.description || '—'}
-                      </p>
-                    </div>
-                  </div>
+              {results.map((card) => {
+                // Find the best entry to show: prefer QR code, then fallback
+                const qrGroup = card.groups.find((g) => g.entry.type === 'qrcode')
+                const linkGroup = card.groups.find((g) => g.entry.type === 'link')
+                const primaryGroup = qrGroup ?? linkGroup
 
-                  <dl className="meta-list">
-                    <div>
-                      <dt>GitHub stars</dt>
-                      <dd>{formatStars(card.githubStars)}</dd>
+                return (
+                  <article className="panel result-card" key={card.productId}>
+                    <div className="card-header">
+                      <div>
+                        <p className="card-title">{card.appName}</p>
+                        <p className="card-description">
+                          {card.description || '—'}
+                        </p>
+                      </div>
                     </div>
-                    <div>
-                      <dt>创建时间</dt>
-                      <dd>{formatDate(card.createdAt)}</dd>
-                    </div>
-                    <div>
-                      <dt>最近验证时间</dt>
-                      <dd>{formatDate(card.verifiedAt)}</dd>
-                    </div>
-                  </dl>
 
-                  <div className="groups-list">
-                    {card.groups.map((group) => (
-                      <section className="group-row" key={group.groupId}>
-                        <div className="group-copy">
-                          <div className="group-tags">
-                            <span className="tag">{group.platform}</span>
-                            <span className="tag muted">{group.groupType}</span>
-                          </div>
+                    <dl className="meta-list">
+                      <div>
+                        <dt>GitHub stars</dt>
+                        <dd>{formatStars(card.githubStars)}</dd>
+                      </div>
+                      <div>
+                        <dt>创建时间</dt>
+                        <dd>{formatDate(card.createdAt)}</dd>
+                      </div>
+                      <div>
+                        <dt>最近验证时间</dt>
+                        <dd>{formatDate(card.verifiedAt)}</dd>
+                      </div>
+                    </dl>
 
-                          {group.entry.type === 'qrcode' ? (
-                            <div className="group-entry">
-                              <img
-                                alt={`${card.appName} ${group.platform}二维码`}
-                                className="qrcode-image"
-                                src={group.entry.imagePath}
-                              />
-                              <div className="group-actions">
-                                <span>已抓取官方群二维码</span>
-                                {group.entry.fallbackUrl ? (
-                                  <a
-                                    className="link-button"
-                                    href={group.entry.fallbackUrl}
-                                    rel="noreferrer"
-                                    target="_blank"
-                                  >
-                                    打开官方群入口
-                                  </a>
-                                ) : null}
+                    <div className="groups-list">
+                      {/*
+                        PRD §6: 一个产品一个主卡片，可展开查看多个官方群。
+                        当前 MVP 阶段：每个 group 类型（平台×群类型）只展示一个，
+                        避免同一产品重复渲染多个相同的子卡片。
+                      */}
+                      {(() => {
+                        const seen = new Set<string>()
+                        const unique = card.groups.filter((g) => {
+                          const key = `${g.platform}-${g.groupType}`
+                          if (seen.has(key)) return false
+                          seen.add(key)
+                          return true
+                        })
+                        return unique.map((group) => (
+                          <section className="group-row" key={group.groupId}>
+                            <div className="group-copy">
+                              <div className="group-tags">
+                                <span className="tag">{group.platform}</span>
+                                <span className="tag muted">{group.groupType}</span>
                               </div>
+
+                              {group.entry.type === 'qrcode' ? (
+                                <div className="group-entry">
+                                  <img
+                                    alt={`${card.appName} ${group.platform}二维码`}
+                                    className="qrcode-image"
+                                    src={group.entry.imagePath}
+                                  />
+                                </div>
+                              ) : (
+                                <div className="group-entry link-only">
+                                  <span>{group.entry.note}</span>
+                                </div>
+                              )}
                             </div>
-                          ) : (
-                            <div className="group-entry link-only">
-                              <div className="group-actions">
-                                <span>{group.entry.note}</span>
+                          </section>
+                        ))
+                      })()}
+
+                      {/* One primary entry action per product card */}
+                      {primaryGroup && (
+                        <div className="primary-entry-action">
+                          {primaryGroup.entry.type === 'qrcode' ? (
+                            <>
+                              <span>已抓取官方群二维码</span>
+                              {primaryGroup.entry.fallbackUrl ? (
                                 <a
                                   className="link-button"
-                                  href={group.entry.url}
+                                  href={primaryGroup.entry.fallbackUrl}
                                   rel="noreferrer"
                                   target="_blank"
                                 >
                                   打开官方群入口
                                 </a>
-                              </div>
-                            </div>
+                              ) : null}
+                            </>
+                          ) : (
+                            <a
+                              className="link-button"
+                              href={primaryGroup.entry.url}
+                              rel="noreferrer"
+                              target="_blank"
+                            >
+                              打开官方群入口
+                            </a>
                           )}
                         </div>
-                      </section>
-                    ))}
-                  </div>
-                </article>
-              ))}
+                      )}
+                    </div>
+                  </article>
+                )
+              })}
             </div>
           ) : null}
 

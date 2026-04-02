@@ -6,7 +6,7 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 from app.core.config import Settings
-from app.search.models import FetchedPage
+from app.search.models import CandidatePageSummary, FetchedPage
 
 
 class PageFetcher:
@@ -22,37 +22,83 @@ class PageFetcher:
     return self._fetch_with_playwright(url)
 
   def collect_relevant_internal_links(self, page: FetchedPage, limit: int = 15) -> list[str]:
+    return [
+      candidate.url
+      for candidate in self.discover_candidate_internal_links(page, limit=min(limit, 8))
+    ]
+
+  def discover_candidate_internal_links(
+    self,
+    page: FetchedPage,
+    limit: int = 8,
+  ) -> list[CandidatePageSummary]:
     soup = BeautifulSoup(page.html, 'html.parser')
-    keywords = (
+    base_url = page.final_url
+    base_host = urlparse(base_url).netloc.lower()
+    current_path = urlparse(base_url).path.rstrip('/')
+    strong_keywords = (
+      'community',
+      'group',
       'join',
       'invite',
-      'community',
-      'contact',
-      'group',
       'wechat',
       'weixin',
       'qq',
       'feishu',
       'lark',
       'qr',
+      'qrcode',
       'forum',
+      'support',
       '社群',
       '社区',
       '群',
-      '联系',
-      '加入',
+      '微信',
+      '飞书',
+      '二维码',
+      '扫码',
+      '加群',
+      '入群',
       '答疑',
       '开发者',
-      'support',
     )
-
-    links: list[str] = []
-    base_host = urlparse(page.final_url).netloc.lower()
+    weak_keywords = (
+      'news',
+      'blog',
+      'event',
+      'events',
+      'developer',
+      'developers',
+      'ecosystem',
+      'open',
+      'activity',
+      'activities',
+      '活动',
+      '新闻',
+      '生态',
+      '开源',
+    )
+    source_markers = {
+      'nav': 12,
+      'menu': 8,
+      'footer': 12,
+      'article': 10,
+      'news': 10,
+      'blog': 8,
+      'event': 8,
+      'community': 14,
+      'support': 12,
+      'developer': 8,
+    }
+    candidates_by_url: dict[str, CandidatePageSummary] = {}
 
     for anchor in soup.find_all('a', href=True):
-      text = anchor.get_text(' ', strip=True)
       href = anchor['href'].strip()
-      absolute = urljoin(page.final_url, href)
+
+      if not href or href.startswith(('mailto:', 'tel:', 'javascript:')):
+        continue
+
+      absolute = urljoin(base_url, href)
       parsed = urlparse(absolute)
 
       if not parsed.scheme.startswith('http'):
@@ -61,18 +107,65 @@ class PageFetcher:
       if parsed.netloc.lower() != base_host:
         continue
 
-      haystack = f'{text} {href}'.lower()
+      normalized_path = parsed.path.rstrip('/')
 
-      if not any(keyword in haystack for keyword in keywords):
+      if normalized_path == current_path and parsed.fragment:
         continue
 
-      if absolute not in links:
-        links.append(absolute)
+      source_text = self._anchor_source_text(anchor, href).lower()
+      score = 0
+      reasons: list[str] = []
 
-      if len(links) >= limit:
-        break
+      for keyword in strong_keywords:
+        if keyword in source_text:
+          score += 65
+          reasons.append(f'strong:{keyword}')
 
-    return links
+      for keyword in weak_keywords:
+        if keyword in source_text:
+          score += 25
+          reasons.append(f'weak:{keyword}')
+
+      source_bonus = self._source_marker_bonus(source_text, source_markers)
+      if source_bonus:
+        score += source_bonus
+        reasons.append('structured-source')
+
+      if parsed.path and any(
+        token in parsed.path.lower()
+        for token in ('news', 'blog', 'event', 'community', 'support', 'developer')
+      ):
+        score += 12
+        reasons.append('path-signal')
+
+      if anchor.get_text(' ', strip=True):
+        score += min(len(anchor.get_text(' ', strip=True)), 20) // 4
+
+      if score <= 0:
+        continue
+
+      candidate = CandidatePageSummary(
+        url=absolute,
+        score=score,
+        source_page=page.final_url,
+        source_type='internal_link',
+        reasons=reasons,
+      )
+      existing = candidates_by_url.get(absolute)
+
+      if existing is None or candidate.score > existing.score:
+        candidates_by_url[absolute] = candidate
+
+    candidates = sorted(
+      candidates_by_url.values(),
+      key=lambda item: (
+        item.score,
+        -self._path_depth(item.url),
+        -len(item.url),
+      ),
+      reverse=True,
+    )
+    return candidates[:limit]
 
   def _fetch_with_http(self, url: str) -> FetchedPage | None:
     try:
@@ -108,6 +201,36 @@ class PageFetcher:
         except Exception:
           pass
 
+        try:
+          page.evaluate(
+            "() => { "
+            "  document.querySelectorAll('details').forEach("
+            "    d => { if (!d.hasAttribute('open')) d.setAttribute('open', ''); }"
+            "  ); "
+            "}",
+          )
+          page.wait_for_timeout(500)
+        except Exception:
+          pass
+
+        try:
+          page.evaluate(
+            "() => { "
+            "  const attrs = ['data-src', 'data-original', 'data-canonical-src']; "
+            "  const imgs = Array.from(document.querySelectorAll('img')); "
+            "  imgs.forEach(img => { "
+            "    if (img.src && img.src !== window.location.href) return; "
+            "    for (const attr of attrs) { "
+            "      const value = img.getAttribute(attr); "
+            "      if (value) { img.src = value; break; } "
+            "    } "
+            "  }); "
+            "}",
+          )
+          page.wait_for_timeout(300)
+        except Exception:
+          pass
+
         html = page.content()
         final_url = page.url
         browser.close()
@@ -139,3 +262,38 @@ class PageFetcher:
       text=text,
       fetch_method=fetch_method,
     )
+
+  def _anchor_source_text(self, anchor, href: str) -> str:
+    parts = [
+      anchor.get_text(' ', strip=True),
+      href,
+      anchor.get('title', ''),
+      anchor.get('aria-label', ''),
+      ' '.join(anchor.get('class', [])),
+    ]
+    current = anchor.parent
+
+    for _ in range(3):
+      if current is None:
+        break
+
+      parts.append(getattr(current, 'name', '') or '')
+      if hasattr(current, 'get'):
+        parts.append(current.get('id', ''))
+        parts.append(' '.join(current.get('class', [])))
+      current = current.parent
+
+    return ' '.join(filter(None, parts))
+
+  def _source_marker_bonus(self, haystack: str, markers: dict[str, int]) -> int:
+    bonus = 0
+
+    for marker, score in markers.items():
+      if marker in haystack:
+        bonus = max(bonus, score)
+
+    return bonus
+
+  def _path_depth(self, url: str) -> int:
+    parsed = urlparse(url)
+    return len([segment for segment in parsed.path.split('/') if segment])

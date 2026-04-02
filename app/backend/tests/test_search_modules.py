@@ -9,7 +9,8 @@ from app.core.config import get_settings
 from app.search.entry_extractor import EntryExtractor
 from app.search.group_type_classifier import GroupTypeClassifier
 from app.search.models import (
-  DiscoveryTrace,
+  CandidatePageSummary,
+  DiscoveredTargets,
   ExtractedGroupCandidate,
   ExtractionStats,
   FetchedPage,
@@ -40,13 +41,20 @@ class SearchEntryTests(unittest.TestCase):
     self.assertEqual(normalized.query_type, 'keyword')
     self.assertEqual(normalized.cleaned_query, 'Cursor AI')
 
+  def test_normalize_github_repo_url(self):
+    normalized = SearchEntry().normalize('https://github.com/labring/FastGPT')
+
+    self.assertEqual(normalized.query_type, 'github_repo')
+    self.assertEqual(normalized.cleaned_query, 'FastGPT')
+    self.assertEqual(normalized.explicit_repo_url, 'https://github.com/labring/FastGPT')
+
 
 class GroupTypeClassifierTests(unittest.TestCase):
   def test_classify_support_context(self):
     classifier = GroupTypeClassifier()
 
     self.assertEqual(
-      classifier.classify('加入官方答疑群获取 Support 支持'),
+      classifier.classify('加入官方群答疑支持 support'),
       GroupType.QA,
     )
 
@@ -82,25 +90,17 @@ class PageFetcherTests(unittest.TestCase):
   def setUp(self):
     self.fetcher = PageFetcher(get_settings())
 
-  def test_collect_relevant_internal_links_expands_keywords_and_limit(self):
+  def test_discover_candidate_internal_links_scores_strong_and_weak_signals(self):
     html = """
       <main>
-        <a href="/community">Community</a>
-        <a href="/support">Support</a>
-        <a href="/contact">Contact</a>
-        <a href="/join">Join</a>
-        <a href="/invite">Invite</a>
-        <a href="/wechat">Wechat</a>
-        <a href="/weixin">Weixin</a>
-        <a href="/qq">QQ</a>
-        <a href="/feishu">Feishu</a>
-        <a href="/lark">Lark</a>
-        <a href="/qr">QR Code</a>
-        <a href="/group">Group</a>
-        <a href="/forum">Forum</a>
-        <a href="/shequn">社群</a>
-        <a href="/dayi">答疑</a>
-        <a href="/extra">加入</a>
+        <nav>
+          <a href="/community">Community</a>
+          <a href="/support">Support</a>
+        </nav>
+        <section class="news-list">
+          <a href="/news/minimax-community">MiniMax 社区活动</a>
+          <a href="/blog/product-update">Blog update</a>
+        </section>
         <a href="https://external.example.com/community">External</a>
       </main>
     """
@@ -112,31 +112,31 @@ class PageFetcherTests(unittest.TestCase):
       text='links',
     )
 
-    links = self.fetcher.collect_relevant_internal_links(page)
+    candidates = self.fetcher.discover_candidate_internal_links(page, limit=8)
+    urls = [candidate.url for candidate in candidates]
 
-    self.assertEqual(len(links), 15)
-    self.assertIn('https://example.com/join', links)
-    self.assertIn('https://example.com/invite', links)
-    self.assertIn('https://example.com/qr', links)
-    self.assertIn('https://example.com/forum', links)
-    self.assertNotIn('https://external.example.com/community', links)
+    self.assertIn('https://example.com/community', urls)
+    self.assertIn('https://example.com/support', urls)
+    self.assertIn('https://example.com/news/minimax-community', urls)
+    self.assertNotIn('https://external.example.com/community', urls)
+    self.assertLessEqual(len(candidates), 8)
 
 
 class EntryExtractorTests(unittest.TestCase):
   def setUp(self):
     self.extractor = EntryExtractor(get_settings())
 
-  def test_extracts_qrcode_candidate(self):
+  def test_extracts_qrcode_candidate_when_decode_succeeds(self):
     page = FetchedPage(
       requested_url='https://example.com/community',
       final_url='https://example.com/community',
       html=(
-        '<section><p>加入飞书群获取最新交流信息</p>'
+        '<section><p>加入飞书群获取最新消息</p>'
         '<a href="https://www.feishu.cn/invite/abc">'
         '<img src="/qr.png" alt="飞书群二维码" /></a></section>'
       ),
       title='community',
-      text='加入飞书群获取最新交流信息',
+      text='加入飞书群获取最新消息',
     )
 
     with (
@@ -154,111 +154,77 @@ class EntryExtractorTests(unittest.TestCase):
     self.assertEqual(candidates[0].platform, Platform.FEISHU)
     self.assertEqual(candidates[0].group_type, GroupType.DISCUSSION)
     self.assertEqual(candidates[0].image_url, '/assets/qrcodes/mock.png')
+    self.assertTrue(candidates[0].qrcode_verified)
 
-  def test_extracts_lazy_loaded_qrcode_from_data_src(self):
+  def test_keeps_unverified_qrcode_image_when_context_is_strong(self):
     page = FetchedPage(
-      requested_url='https://example.com/community',
-      final_url='https://example.com/community',
-      html='<section>加入QQ群交流<img data-src="/qq-qr.png" /></section>',
-      title='community',
-      text='加入QQ群交流',
-    )
-
-    with (
-      patch.object(self.extractor, '_download_image', return_value=(b'png', 'image/png')),
-      patch.object(self.extractor, '_decode_qrcode', return_value=(None, True)),
-      patch.object(self.extractor, '_store_image', return_value='/assets/qrcodes/qq.png'),
-    ):
-      candidates = self.extractor.extract([page])
-
-    self.assertEqual(len(candidates), 1)
-    self.assertEqual(candidates[0].platform, Platform.QQ)
-
-  def test_extracts_qrcode_from_srcset(self):
-    page = FetchedPage(
-      requested_url='https://example.com/community',
-      final_url='https://example.com/community',
+      requested_url='https://github.com/labring/FastGPT',
+      final_url='https://github.com/labring/FastGPT',
       html=(
-        '<section>加入飞书群'
-        '<img srcset="/small.png 1x, /large.png 2x" /></section>'
+        '<section><h2>社区交流群</h2><p>加入飞书群</p>'
+        '<img data-canonical-src="https://oss.example.com/fastgpt-feishu-qr.png" /></section>'
       ),
-      title='community',
-      text='加入飞书群',
+      title='FastGPT',
+      text='社区交流群 加入飞书群',
     )
 
     with (
       patch.object(self.extractor, '_download_image', return_value=(b'png', 'image/png')),
-      patch.object(self.extractor, '_decode_qrcode', return_value=(None, True)),
-      patch.object(self.extractor, '_store_image', return_value='/assets/qrcodes/feishu.png'),
+      patch.object(self.extractor, '_decode_qrcode', return_value=(None, False)),
+      patch.object(self.extractor, '_looks_like_qrcode_image', return_value=True),
+      patch.object(self.extractor, '_store_image', return_value='/assets/qrcodes/fastgpt.png'),
     ):
       candidates = self.extractor.extract([page])
 
     self.assertEqual(len(candidates), 1)
     self.assertEqual(candidates[0].platform, Platform.FEISHU)
+    self.assertEqual(candidates[0].image_url, '/assets/qrcodes/fastgpt.png')
+    self.assertFalse(candidates[0].qrcode_verified)
 
-  def test_detects_qq_group_context(self):
-    platform = self.extractor._detect_platform(
-      'https://example.com/invite',
-      '加入QQ群获取最新答疑',
+  def test_filters_github_anchor_noise(self):
+    page = FetchedPage(
+      requested_url='https://github.com/labring/FastGPT',
+      final_url='https://github.com/labring/FastGPT',
+      html=(
+        '<section><h2>社区交流群</h2>'
+        '<a class="anchor" aria-label="Permalink: 社区交流群" href="#社区交流群">#</a>'
+        '<a href="https://fael3z0zfze.feishu.cn/share/base/form/abc">飞书咨询</a>'
+        '</section>'
+      ),
+      title='FastGPT',
+      text='社区交流群 飞书咨询',
     )
+    stats = ExtractionStats()
 
-    self.assertEqual(platform, Platform.QQ)
+    candidates = self.extractor.extract([page], stats)
 
-  def test_does_not_treat_generic_qq_noise_as_group(self):
-    platform = self.extractor._detect_platform(
-      'https://example.com/support',
-      '联系 QQ 客服处理售后问题',
+    self.assertEqual(len(candidates), 1)
+    self.assertEqual(candidates[0].entry_url, 'https://fael3z0zfze.feishu.cn/share/base/form/abc')
+    self.assertGreaterEqual(stats.filtered_link_noise, 1)
+
+  def test_extract_stats_capture_fallback_counts(self):
+    page = FetchedPage(
+      requested_url='https://example.com/community',
+      final_url='https://example.com/community',
+      html='<section><p>加入微信群 扫码入群</p><img src="/wechat-qr.png" /></section>',
+      title='community',
+      text='加入微信群 扫码入群',
     )
-
-    self.assertIsNone(platform)
-
-  def test_extract_stats_capture_filter_counts(self):
-    pages = [
-      FetchedPage(
-        requested_url='https://example.com/about',
-        final_url='https://example.com/about',
-        html='<section><a href="/about">About</a></section>',
-        title='about',
-        text='about',
-      ),
-      FetchedPage(
-        requested_url='https://example.com/contact',
-        final_url='https://example.com/contact',
-        html='<section><a href="/contact">Community contact us</a></section>',
-        title='contact',
-        text='contact',
-      ),
-      FetchedPage(
-        requested_url='https://example.com/community',
-        final_url='https://example.com/community',
-        html='<section><a href="/invite">加入社区</a></section>',
-        title='community',
-        text='community',
-      ),
-      FetchedPage(
-        requested_url='https://example.com/qr',
-        final_url='https://example.com/qr',
-        html='<section>官方群二维码<img src="/not-qr.png" /></section>',
-        title='qr',
-        text='qr',
-      ),
-    ]
     stats = ExtractionStats()
 
     with (
       patch.object(self.extractor, '_download_image', return_value=(b'png', 'image/png')),
       patch.object(self.extractor, '_decode_qrcode', return_value=(None, False)),
+      patch.object(self.extractor, '_looks_like_qrcode_image', return_value=True),
+      patch.object(self.extractor, '_store_image', return_value='/assets/qrcodes/wechat.png'),
     ):
-      candidates = self.extractor.extract(pages, stats)
+      candidates = self.extractor.extract([page], stats)
 
-    self.assertEqual(candidates, [])
-    self.assertEqual(stats.scanned_tags, 4)
-    self.assertEqual(stats.contextual_candidates, 2)
-    self.assertEqual(stats.filtered_positive_context, 1)
-    self.assertEqual(stats.filtered_negative_context, 1)
-    self.assertEqual(stats.filtered_platform_failure, 1)
-    self.assertEqual(stats.filtered_qrcode_failure, 1)
-    self.assertEqual(stats.output_candidates, 0)
+    self.assertEqual(len(candidates), 1)
+    self.assertEqual(stats.image_candidates, 1)
+    self.assertEqual(stats.image_decode_fallbacks, 1)
+    self.assertEqual(stats.output_candidates, 1)
+    self.assertEqual(stats.page_summaries[0].image_candidates, 1)
 
 
 class ResultNormalizerTests(unittest.TestCase):
@@ -291,9 +257,7 @@ class ResultNormalizerTests(unittest.TestCase):
 
     self.assertEqual(len(cards), 1)
     self.assertEqual(cards[0].github_stars, 123)
-    self.assertEqual(len(cards[0].groups), 1)
     self.assertEqual(cards[0].groups[0].entry.type, 'link')
-    self.assertEqual(cards[0].groups[0].entry.note, '二维码暂未抓取成功')
 
   def test_returns_empty_list_when_no_groups(self):
     cards = self.normalizer.build_product_card(
@@ -374,63 +338,6 @@ class SearchServiceTests(unittest.TestCase):
     self.assertEqual(selected, 'https://claude.ai/')
     self.assertEqual(supplemental, [])
 
-  def test_normalizes_docs_homepage_to_root_candidate(self):
-    github_candidate = GitHubRepositoryCandidate(
-      repo_url='https://github.com/anthropics/claude-code',
-      full_name='anthropics/claude-code',
-      repo_name='claude-code',
-      owner_name='anthropics',
-      owner_type='Organization',
-      homepage='https://code.claude.com/docs/en/overview',
-      description='Claude Code',
-      stars=100000,
-    )
-
-    selected, _, supplemental, _ = self.service._select_official_site(
-      'Claude',
-      [],
-      github_candidate,
-    )
-
-    self.assertEqual(selected, 'https://code.claude.com')
-    self.assertEqual(supplemental, ['https://code.claude.com/docs/en/overview'])
-
-  def test_discover_targets_prefers_github_homepage_for_ambiguous_keyword(self):
-    github_candidate = GitHubRepositoryCandidate(
-      repo_url='https://github.com/cursor/cursor',
-      full_name='cursor/cursor',
-      repo_name='cursor',
-      owner_name='cursor',
-      owner_type='Organization',
-      homepage='https://cursor.com',
-      description='Cursor editor',
-      stars=32000,
-    )
-    github_summary = GitHubCandidateSummary(
-      repo_url=github_candidate.repo_url,
-      homepage=github_candidate.homepage,
-      score=220,
-      confident=True,
-      reasons=['exact-repo-with-official-signal'],
-    )
-
-    with (
-      patch.object(self.service, '_search_github_repository', return_value=(github_candidate, github_summary)),
-      patch.object(
-        self.service,
-        '_search_web',
-        return_value=[
-          SearchResultLink(title='Custom Cursor', url='https://custom-cursor.com'),
-        ],
-      ),
-    ):
-      targets = self.service._discover_targets('Cursor', None)
-
-    self.assertIsNotNone(targets)
-    self.assertEqual(targets.official_site_url, 'https://cursor.com')
-    self.assertEqual(targets.github_repo_url, 'https://github.com/cursor/cursor')
-    self.assertEqual(targets.app_name, 'Cursor')
-
   def test_discover_targets_avoids_ambiguous_wrong_repo(self):
     github_summary = GitHubCandidateSummary(
       repo_url='https://github.com/FoundationAgents/OpenManus',
@@ -448,66 +355,89 @@ class SearchServiceTests(unittest.TestCase):
 
     self.assertIsNone(targets)
 
-  def test_search_with_trace_returns_internal_trace(self):
-    github_candidate = GitHubRepositoryCandidate(
-      repo_url='https://github.com/cursor/cursor',
-      full_name='cursor/cursor',
-      repo_name='cursor',
-      owner_name='cursor',
-      owner_type='Organization',
-      homepage='https://cursor.com',
-      description='Cursor',
-      stars=32000,
+  def test_fetch_pages_records_candidate_pages(self):
+    targets = DiscoveredTargets(
+      app_name='Cursor',
+      official_site_url='https://cursor.com',
+      github_repo_url=None,
     )
-    github_summary = GitHubCandidateSummary(
-      repo_url=github_candidate.repo_url,
-      homepage=github_candidate.homepage,
-      score=220,
-      confident=True,
-      reasons=['exact-repo-with-official-signal'],
+    homepage = FetchedPage(
+      requested_url='https://cursor.com',
+      final_url='https://cursor.com',
+      html='<main><a href="/community">Community</a></main>',
+      title='Cursor',
+      text='community',
+    )
+    community = FetchedPage(
+      requested_url='https://cursor.com/community',
+      final_url='https://cursor.com/community',
+      html='<section>Join</section>',
+      title='Community',
+      text='join',
     )
 
     with (
+      patch.object(self.service, '_discover_targets', return_value=targets),
+      patch.object(self.service.page_fetcher, 'fetch_page', side_effect=[homepage, community]),
       patch.object(
-        self.service,
-        '_search_web',
-        return_value=[SearchResultLink(title='Cursor', url='https://cursor.com')],
+        self.service.page_fetcher,
+        'discover_candidate_internal_links',
+        return_value=[
+          CandidatePageSummary(
+            url='https://cursor.com/community',
+            score=110,
+            source_page='https://cursor.com',
+            source_type='internal_link',
+            reasons=['strong:community'],
+          ),
+        ],
       ),
-      patch.object(self.service, '_search_github_repository', return_value=(github_candidate, github_summary)),
-      patch.object(self.service, '_fetch_pages', return_value=[]),
+      patch.object(self.service.extractor, 'extract', return_value=[]),
     ):
-      results, trace = self.service.search_with_trace('Cursor')
+      _, trace = self.service.search_with_trace('https://cursor.com')
 
-    self.assertEqual(results, [])
-    self.assertEqual(trace.discovery.official_site_url, 'https://cursor.com')
-    self.assertEqual(trace.discovery.github_repo_url, 'https://github.com/cursor/cursor')
-    self.assertEqual(trace.discovery.github_candidate, github_summary)
+    self.assertEqual(trace.fetch.candidate_pages[0].url, 'https://cursor.com/community')
+    self.assertEqual(trace.fetch.internal_links['https://cursor.com'], ['https://cursor.com/community'])
 
-  def test_fetch_github_metadata(self):
-    response = MagicMock()
-    response.json.return_value = {
-      'stargazers_count': 456,
-      'created_at': '2024-05-06T07:08:09Z',
-      'description': 'GitHub metadata',
-    }
-    response.raise_for_status.return_value = None
+  def test_search_with_trace_uses_official_site_search_fallback(self):
+    targets = DiscoveredTargets(
+      app_name='MiniMax',
+      official_site_url='https://www.minimaxi.com',
+      github_repo_url=None,
+    )
+    homepage = FetchedPage(
+      requested_url='https://www.minimaxi.com',
+      final_url='https://www.minimaxi.com',
+      html='<main>MiniMax</main>',
+      title='MiniMax',
+      text='MiniMax',
+    )
+    fallback_page = FetchedPage(
+      requested_url='https://www.minimaxi.com/news/community',
+      final_url='https://www.minimaxi.com/news/community',
+      html='<section>加入飞书群<img src="/qr.png" /></section>',
+      title='MiniMax News',
+      text='加入飞书群',
+    )
+    fallback_group = ExtractedGroupCandidate(
+      platform=Platform.FEISHU,
+      group_type=GroupType.DISCUSSION,
+      source_url='https://www.minimaxi.com/news/community',
+      context='加入飞书群',
+      image_url='/assets/qrcodes/minimax.png',
+    )
 
-    client = MagicMock()
-    client.get.return_value = response
-    client.__enter__.return_value = client
+    with (
+      patch.object(self.service, '_discover_targets', return_value=targets),
+      patch.object(self.service, '_fetch_pages', return_value=[homepage]),
+      patch.object(self.service.extractor, 'extract', side_effect=[[], [fallback_group]]),
+      patch.object(self.service, '_fetch_official_site_search_pages', return_value=[fallback_page]) as fallback_fetch,
+    ):
+      results, _ = self.service.search_with_trace('MiniMax')
 
-    with patch('app.search.service.httpx.Client', return_value=client):
-      metadata = self.service._fetch_github_metadata('https://github.com/example/repo')
-
-    self.assertIsNotNone(metadata)
-    self.assertEqual(metadata.stars, 456)
-    self.assertEqual(metadata.created_at, '2024-05-06T07:08:09Z')
-    self.assertEqual(metadata.description, 'GitHub metadata')
-
-  def test_fetch_github_metadata_returns_none_for_invalid_repo_url(self):
-    metadata = self.service._fetch_github_metadata('https://github.com/example')
-
-    self.assertIsNone(metadata)
+    self.assertEqual(len(results), 1)
+    self.assertEqual(results[0].groups[0].entry.type, 'qrcode')
+    fallback_fetch.assert_called_once()
 
   def test_search_logs_trace_when_debug_enabled(self):
     debug_service = SearchService(

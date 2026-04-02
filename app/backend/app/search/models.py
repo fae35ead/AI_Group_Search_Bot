@@ -9,6 +9,7 @@ class NormalizedQuery:
   cleaned_query: str
   query_type: str
   domain: str | None = None
+  explicit_repo_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class GitHubRepositoryMetadata:
   stars: int | None
   created_at: str | None
   description: str | None = None
+  homepage: str | None = None
 
 
 @dataclass(frozen=True)
@@ -90,21 +92,50 @@ class FetchedPageSummary:
   fetch_method: str
 
 
+@dataclass(frozen=True)
+class CandidatePageSummary:
+  url: str
+  score: int
+  source_page: str
+  source_type: str
+  reasons: list[str] = field(default_factory=list)
+
+
 @dataclass
 class FetchTrace:
   fetched_pages: list[FetchedPageSummary] = field(default_factory=list)
   internal_links: dict[str, list[str]] = field(default_factory=dict)
+  candidate_pages: list[CandidatePageSummary] = field(default_factory=list)
+  site_search_queries: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PageExtractionSummary:
+  page_url: str
+  scanned_tags: int = 0
+  contextual_candidates: int = 0
+  image_candidates: int = 0
+  link_candidates: int = 0
+  output_candidates: int = 0
 
 
 @dataclass
 class ExtractionStats:
   scanned_tags: int = 0
   contextual_candidates: int = 0
+  image_candidates: int = 0
+  link_candidates: int = 0
   output_candidates: int = 0
+  image_download_failures: int = 0
+  image_decode_successes: int = 0
+  image_decode_fallbacks: int = 0
   filtered_positive_context: int = 0
   filtered_negative_context: int = 0
   filtered_platform_failure: int = 0
   filtered_qrcode_failure: int = 0
+  filtered_link_noise: int = 0
+  deduplicated_candidates: int = 0
+  page_summaries: list[PageExtractionSummary] = field(default_factory=list)
 
 
 @dataclass
@@ -129,4 +160,5 @@ class ExtractedGroupCandidate:
   entry_url: str | None = None
   fallback_url: str | None = None
   decoded_payload: str | None = None
+  qrcode_verified: bool = False
   source_urls: list[str] = field(default_factory=list)

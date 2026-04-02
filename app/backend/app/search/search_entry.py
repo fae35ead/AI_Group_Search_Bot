@@ -7,6 +7,11 @@ DOMAIN_PATTERN = re.compile(
   r'^(?:https?://)?(?:www\.)?([a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+)(?:/.*)?$',
 )
 
+GITHUB_URL_PATTERN = re.compile(
+  r'^(?:https?://)?(?:www\.)?github\.com/([^/]+)/([^/\s]+)(?:/.*)?$',
+  re.IGNORECASE,
+)
+
 
 class SearchEntry:
   def normalize(self, query: str) -> NormalizedQuery:
@@ -14,6 +19,21 @@ class SearchEntry:
 
     if not cleaned:
       raise ValueError('query must not be empty')
+
+    # Detect full GitHub repo URL first (takes priority over domain parsing)
+    github_match = GITHUB_URL_PATTERN.match(cleaned)
+
+    if github_match:
+      owner, repo = github_match.group(1), github_match.group(2)
+      repo = repo.rstrip('/')
+      explicit_repo_url = f'https://github.com/{owner}/{repo}'
+      return NormalizedQuery(
+        raw_query=query,
+        cleaned_query=repo,
+        query_type='github_repo',
+        domain=None,
+        explicit_repo_url=explicit_repo_url,
+      )
 
     domain = self._extract_domain(cleaned)
     query_type = 'domain' if domain else 'keyword'

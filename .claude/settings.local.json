@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python.exe -m unittest discover -s tests -v)",
+      "Bash(.venv/Scripts/python.exe -m compileall .)",
+      "Bash(.venv/Scripts/python.exe -m unittest discover -s tests)",
+      "Bash(.venv/Scripts/python.exe -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload)",
+      "Bash(npm run:*)",
+      "Bash(.venv/Scripts/python.exe -m uvicorn main:app --host 127.0.0.1 --port 8000)",
+      "Bash(curl -s http://127.0.0.1:8000/api/health)",
+      "Bash(netstat -ano)",
+      "Bash(taskkill //F //PID 45128)",
+      "Bash(curl -s http://127.0.0.1:5180)",
+      "Bash(wmic process:*)",
+      "Bash(taskkill //F //IM python.exe)",
+      "Bash(.venv/Scripts/python.exe -m unittest test_search_modules.EntryExtractorTests -v)",
+      "Bash(grep -E \"\\(ERROR|FAIL|ok$\\)\")"
+    ]
+  }
+}

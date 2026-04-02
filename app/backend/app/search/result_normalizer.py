@@ -1,7 +1,5 @@
 import hashlib
 from datetime import datetime, timezone
-from pathlib import Path
-from urllib.parse import urlparse
 
 from app.api.schemas import LinkEntry, OfficialGroup, ProductCard, QRCodeEntry
 from app.search.models import ExtractedGroupCandidate, GitHubRepositoryMetadata
@@ -36,14 +34,20 @@ class ResultNormalizer:
         ),
       )
 
-    normalized_groups.sort(key=lambda item: (item.platform.value, item.group_type.value))
+    normalized_groups.sort(
+      key=lambda item: (
+        item.entry.type != 'qrcode',
+        item.platform.value,
+        item.group_type.value,
+      ),
+    )
     product_id = self._slugify(app_name)
 
     return [
       ProductCard(
         product_id=product_id,
         app_name=app_name,
-        description=description or '—',
+        description=description or '-',
         github_stars=github.stars if github else None,
         created_at=self._parse_datetime(github.created_at if github else None),
         verified_at=verified_at,
