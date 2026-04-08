@@ -1,9 +1,11 @@
 import base64
+import csv
 import hashlib
 import json
 import logging
 import random
 import re
+import shutil
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -51,6 +53,7 @@ MAX_RECOMMENDATIONS = 12
 RECOMMENDATION_POOL_SIZE = 120
 MAX_RECOMMENDATIONS_FETCH = 60
 CANDIDATE_FETCH_MAX_WORKERS = 4
+GITHUB_VARIANT_MAX_WORKERS = 4
 GITHUB_SEARCH_TIMEOUT = 10.0
 PAGE_FETCH_TIMEOUT = 8.0
 WEB_SEARCH_TIMEOUT = 8.0
@@ -648,34 +651,50 @@ class SearchService:
     all_candidates: list[GitHubRepositoryCandidate] = []
     seen_keys: set[str] = set()
 
-    for variant_query, per_page in unique_variants:
+    for chunk_start in range(0, len(unique_variants), GITHUB_VARIANT_MAX_WORKERS):
       if len(all_candidates) >= limit:
         break
 
-      raw_candidates = self._github_search_onevariant(variant_query, per_page)
-      duplicate_count = 0
-      filtered_count = 0
-      added_count = 0
-      for candidate in raw_candidates:
-        candidate_key = self._candidate_key(candidate)
-        if candidate_key in seen_keys:
-          duplicate_count += 1
-          continue
-        seen_keys.add(candidate_key)
-        if self._should_filter(candidate, filters):
-          filtered_count += 1
-          continue
-        all_candidates.append(candidate)
-        added_count += 1
-      self._debug_log(
-        'github_variant=%r per_page=%d raw=%d added=%d filtered=%d duplicate=%d',
-        variant_query,
-        per_page,
-        len(raw_candidates),
-        added_count,
-        filtered_count,
-        duplicate_count,
-      )
+      chunk = unique_variants[chunk_start:chunk_start + GITHUB_VARIANT_MAX_WORKERS]
+      with ThreadPoolExecutor(max_workers=min(GITHUB_VARIANT_MAX_WORKERS, len(chunk))) as executor:
+        chunk_futures = [
+          (variant_query, per_page, executor.submit(self._github_search_onevariant, variant_query, per_page))
+          for variant_query, per_page in chunk
+        ]
+
+        for variant_query, per_page, future in chunk_futures:
+          if len(all_candidates) >= limit:
+            break
+
+          try:
+            raw_candidates = future.result()
+          except Exception as exc:
+            logger.warning('GitHub search failed for %r: %s', variant_query, exc)
+            raw_candidates = []
+
+          duplicate_count = 0
+          filtered_count = 0
+          added_count = 0
+          for candidate in raw_candidates:
+            candidate_key = self._candidate_key(candidate)
+            if candidate_key in seen_keys:
+              duplicate_count += 1
+              continue
+            seen_keys.add(candidate_key)
+            if self._should_filter(candidate, filters):
+              filtered_count += 1
+              continue
+            all_candidates.append(candidate)
+            added_count += 1
+          self._debug_log(
+            'github_variant=%r per_page=%d raw=%d added=%d filtered=%d duplicate=%d',
+            variant_query,
+            per_page,
+            len(raw_candidates),
+            added_count,
+            filtered_count,
+            duplicate_count,
+          )
 
     all_candidates.sort(
       key=lambda item: (
@@ -1004,7 +1023,7 @@ class SearchService:
     payload = {
       'query': query.strip().lower(),
       'filters': self._serialize_filters(filters),
-      'version': 4,
+      'version': 5,
     }
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
     return hashlib.sha1(raw.encode('utf-8')).hexdigest()
@@ -1086,12 +1105,16 @@ class SearchService:
     changed = False
     for card in cards:
       for group in card.groups:
+        canonical_platform = self._canonicalize_platform(group.platform)
+        if canonical_platform != group.platform:
+          group.platform = canonical_platform
+          changed = True
         if group.entry.type != 'qrcode':
           continue
         normalized = self._normalize_legacy_qrcode_path(
           group.entry.image_path,
           app_name=card.app_name,
-          platform=group.platform,
+          platform=canonical_platform,
         )
         if normalized == group.entry.image_path:
           continue
@@ -1099,9 +1122,176 @@ class SearchService:
         changed = True
     return cards, changed
 
+  def _canonicalize_platform(self, platform: Platform) -> Platform:
+    if platform == Platform.WECOM:
+      return Platform.WECHAT
+    return platform
+
   def _safe_qrcode_name(self, value: str, *, fallback: str) -> str:
     sanitized = ''.join(ch for ch in value if ch.isalnum() or ch in '-_').strip()
     return sanitized or fallback
+
+  def _ensure_viewed_export_paths(self) -> None:
+    self.settings.viewed_dir.mkdir(parents=True, exist_ok=True)
+    self.settings.viewed_qrcode_dir.mkdir(parents=True, exist_ok=True)
+
+  def _build_viewed_qrcode_export_filename(
+    self,
+    *,
+    app_name: str,
+    platform: Platform,
+    view_key: str,
+    source_filename: str,
+  ) -> str:
+    extension = source_filename.rsplit('.', 1)[-1].lower() if '.' in source_filename else 'png'
+    safe_name = self._safe_qrcode_name(app_name, fallback='repo')
+    safe_platform = self._safe_qrcode_name(self._canonicalize_platform(platform).value, fallback='platform')
+    safe_view_key = self._safe_qrcode_name(view_key[:8], fallback='viewed')
+    return f'{safe_name}_{safe_platform}_{safe_view_key}.{extension}'
+
+  def _resolve_qrcode_asset_source(self, image_path: str | None) -> tuple[str, str] | None:
+    normalized_path = (image_path or '').strip()
+    if not normalized_path.startswith('/assets/qrcodes/'):
+      return None
+
+    filename = normalized_path.rsplit('/', 1)[-1]
+    if not filename:
+      return None
+
+    return filename, str(self.settings.qrcode_dir / filename)
+
+  def _sync_viewed_exports(self) -> None:
+    self._ensure_viewed_export_paths()
+    expected_qrcode_filenames: set[str] = set()
+    csv_rows: list[dict[str, str]] = []
+    normalized_image_updates: list[tuple[str, str]] = []
+    canonical_platform_updates: list[tuple[str, Platform]] = []
+
+    with get_connection(self.settings.database_path) as connection:
+      rows = connection.execute(
+        '''
+        SELECT
+          view_key,
+          product_id,
+          app_name,
+          platform,
+          group_type,
+          entry_type,
+          entry_url,
+          image_path,
+          fallback_url,
+          viewed_at
+        FROM viewed_groups
+        ORDER BY viewed_at DESC
+        ''',
+      ).fetchall()
+
+    for row in rows:
+      try:
+        raw_platform = Platform(str(row['platform']))
+        group_type = GroupType(str(row['group_type']))
+      except ValueError:
+        continue
+      platform = self._canonicalize_platform(raw_platform)
+      if platform != raw_platform:
+        canonical_platform_updates.append((str(row['view_key']), platform))
+
+      view_key = str(row['view_key'])
+      app_name = str(row['app_name'])
+      entry_type = str(row['entry_type'])
+      entry_url = str(row['entry_url'] or '').strip()
+      fallback_url = str(row['fallback_url'] or '').strip()
+      viewed_at = str(row['viewed_at'] or '').strip()
+
+      if entry_type == 'qrcode':
+        image_path = str(row['image_path'] or '').strip()
+        if not image_path:
+          continue
+
+        normalized_image_path = self._normalize_legacy_qrcode_path(
+          image_path,
+          app_name=app_name,
+          platform=platform,
+        )
+        if normalized_image_path != image_path:
+          normalized_image_updates.append((view_key, normalized_image_path))
+
+        resolved_source = self._resolve_qrcode_asset_source(normalized_image_path)
+        if resolved_source is None:
+          logger.warning(
+            'Skipping viewed qrcode export with unsupported image path: %s',
+            normalized_image_path,
+          )
+          continue
+
+        source_filename, source_path_raw = resolved_source
+        export_filename = self._build_viewed_qrcode_export_filename(
+          app_name=app_name,
+          platform=platform,
+          view_key=view_key,
+          source_filename=source_filename,
+        )
+        expected_qrcode_filenames.add(export_filename)
+        export_path = self.settings.viewed_qrcode_dir / export_filename
+        source_path = self.settings.qrcode_dir / source_filename
+
+        if source_path.exists():
+          if not export_path.exists():
+            shutil.copyfile(source_path, export_path)
+        else:
+          logger.warning(
+            'Skipping viewed qrcode export because source file is missing: %s',
+            source_path_raw,
+          )
+        continue
+
+      if entry_type not in {'link', 'qq_number'} or not entry_url:
+        continue
+
+      csv_rows.append(
+        {
+          'view_key': view_key,
+          'product_id': str(row['product_id']),
+          'app_name': app_name,
+          'platform': platform.value,
+          'group_type': group_type.value,
+          'entry_type': entry_type,
+          'entry_value': entry_url,
+          'fallback_url': fallback_url,
+          'viewed_at': viewed_at,
+        },
+      )
+
+    self._update_viewed_group_image_paths(normalized_image_updates)
+    self._update_viewed_group_platforms(canonical_platform_updates)
+
+    for existing_file in self.settings.viewed_qrcode_dir.iterdir():
+      if existing_file.is_file() and existing_file.name not in expected_qrcode_filenames:
+        existing_file.unlink()
+
+    with self.settings.viewed_links_csv_path.open('w', encoding='utf-8-sig', newline='') as csv_file:
+      writer = csv.DictWriter(
+        csv_file,
+        fieldnames=[
+          'view_key',
+          'product_id',
+          'app_name',
+          'platform',
+          'group_type',
+          'entry_type',
+          'entry_value',
+          'fallback_url',
+          'viewed_at',
+        ],
+      )
+      writer.writeheader()
+      writer.writerows(csv_rows)
+
+  def _sync_viewed_exports_safely(self) -> None:
+    try:
+      self._sync_viewed_exports()
+    except Exception as exc:
+      logger.warning('Failed to sync viewed exports: %s', exc)
 
   def _normalize_legacy_qrcode_path(self, image_path: str, *, app_name: str, platform: Platform) -> str:
     normalized_path = image_path.strip()
@@ -1109,17 +1299,20 @@ class SearchService:
       return image_path
 
     filename = normalized_path.rsplit('/', 1)[-1]
-    if not LEGACY_QRCODE_FILENAME_PATTERN.fullmatch(filename):
-      return image_path
-
     source = self.settings.qrcode_dir / filename
     if not source.exists():
       return image_path
 
-    digest = source.stem[:8]
+    if LEGACY_QRCODE_FILENAME_PATTERN.fullmatch(filename):
+      digest = source.stem[:8]
+    else:
+      stem_parts = [part for part in source.stem.split('_') if part]
+      digest = (stem_parts[-1] if stem_parts else source.stem)[-8:]
+      if not digest:
+        digest = source.stem[:8]
     extension = source.suffix.lstrip('.').lower() or 'png'
     safe_name = self._safe_qrcode_name(app_name, fallback='repo')
-    safe_platform = self._safe_qrcode_name(platform.value, fallback='platform')
+    safe_platform = self._safe_qrcode_name(self._canonicalize_platform(platform).value, fallback='platform')
     target_filename = f'{safe_name}_{safe_platform}_{digest}.{extension}'
     target = self.settings.qrcode_dir / target_filename
 
@@ -1147,23 +1340,139 @@ class SearchService:
     except Exception as exc:
       logger.warning('Failed to update viewed group image paths: %s', exc)
 
-  def _load_viewed_group_keys(self) -> set[str]:
+  def _update_viewed_group_platforms(self, updates: list[tuple[str, Platform]]) -> None:
+    if not updates:
+      return
     try:
       with get_connection(self.settings.database_path) as connection:
-        rows = connection.execute('SELECT view_key FROM viewed_groups').fetchall()
+        connection.executemany(
+          'UPDATE viewed_groups SET platform = ? WHERE view_key = ?',
+          [(platform.value, view_key) for view_key, platform in updates],
+        )
+        connection.commit()
+    except Exception as exc:
+      logger.warning('Failed to update viewed group platforms: %s', exc)
+
+  def _build_viewed_group_match_key(
+    self,
+    *,
+    product_id: str,
+    platform: Platform,
+    entry_type: str,
+    entry_url: str | None = None,
+    image_path: str | None = None,
+  ) -> str | None:
+    canonical_platform = self._canonicalize_platform(platform)
+    if entry_type == 'qq_number':
+      qq_number = (entry_url or '').strip()
+      if not qq_number:
+        return None
+      return f'{product_id}:{canonical_platform.value}:qq_number:{qq_number}'
+
+    if entry_type == 'qrcode':
+      normalized_path = (image_path or '').strip()
+      if not normalized_path:
+        return None
+      return f'{product_id}:{canonical_platform.value}:qrcode:{normalized_path}'
+
+    if entry_type == 'link':
+      normalized_link = self._normalize_group_link((entry_url or '').strip(), canonical_platform)
+      if not normalized_link:
+        normalized_link = (entry_url or '').strip()
+      if not normalized_link:
+        return None
+      return f'{product_id}:{canonical_platform.value}:link:{normalized_link}'
+
+    return None
+
+  def _load_viewed_group_filters(self) -> tuple[set[str], set[str]]:
+    viewed_ids: set[str] = set()
+    viewed_match_keys: set[str] = set()
+    normalized_image_updates: list[tuple[str, str]] = []
+    canonical_platform_updates: list[tuple[str, Platform]] = []
+    try:
+      with get_connection(self.settings.database_path) as connection:
+        rows = connection.execute(
+          '''
+          SELECT
+            view_key,
+            product_id,
+            app_name,
+            platform,
+            entry_type,
+            entry_url,
+            image_path
+          FROM viewed_groups
+          ''',
+        ).fetchall()
     except Exception as exc:
       logger.warning('Failed to read viewed groups: %s', exc)
-      return set()
-    return {str(row['view_key']) for row in rows}
+      return set(), set()
+
+    for row in rows:
+      view_key = str(row['view_key'])
+      viewed_ids.add(view_key)
+      try:
+        raw_platform = Platform(str(row['platform']))
+      except ValueError:
+        continue
+      platform = self._canonicalize_platform(raw_platform)
+      if platform != raw_platform:
+        canonical_platform_updates.append((view_key, platform))
+
+      entry_type = str(row['entry_type'] or '').strip()
+      image_path = str(row['image_path'] or '').strip()
+      if entry_type == 'qrcode' and image_path:
+        normalized_path = self._normalize_legacy_qrcode_path(
+          image_path,
+          app_name=str(row['app_name']),
+          platform=platform,
+        )
+        if normalized_path != image_path:
+          normalized_image_updates.append((view_key, normalized_path))
+          image_path = normalized_path
+
+      match_key = self._build_viewed_group_match_key(
+        product_id=str(row['product_id']),
+        platform=platform,
+        entry_type=entry_type,
+        entry_url=str(row['entry_url'] or '').strip(),
+        image_path=image_path,
+      )
+      if match_key:
+        viewed_match_keys.add(match_key)
+
+    self._update_viewed_group_image_paths(normalized_image_updates)
+    self._update_viewed_group_platforms(canonical_platform_updates)
+    return viewed_ids, viewed_match_keys
 
   def _filter_viewed_cards(self, cards: list[ProductCard]) -> list[ProductCard]:
-    viewed_keys = self._load_viewed_group_keys()
-    if not viewed_keys:
+    viewed_keys, viewed_match_keys = self._load_viewed_group_filters()
+    if not viewed_keys and not viewed_match_keys:
       return cards
 
     filtered: list[ProductCard] = []
     for card in cards:
-      remaining_groups = [group for group in card.groups if group.group_id not in viewed_keys]
+      remaining_groups = [
+        group
+        for group in card.groups
+        if (
+          group.group_id not in viewed_keys
+          and self._build_viewed_group_match_key(
+            product_id=card.product_id,
+            platform=group.platform,
+            entry_type=group.entry.type,
+            entry_url=(
+              group.entry.qq_number
+              if group.entry.type == 'qq_number'
+              else group.entry.url
+              if group.entry.type == 'link'
+              else None
+            ),
+            image_path=group.entry.image_path if group.entry.type == 'qrcode' else None,
+          ) not in viewed_match_keys
+        )
+      ]
       if not remaining_groups:
         continue
 
@@ -1191,6 +1500,14 @@ class SearchService:
       entry_url = group.entry.qq_number
     else:
       entry_url = group.entry.url
+
+    platform = self._canonicalize_platform(group.platform)
+    if image_path:
+      image_path = self._normalize_legacy_qrcode_path(
+        image_path,
+        app_name=app_name,
+        platform=platform,
+      )
 
     now = datetime.now(timezone.utc).isoformat()
     try:
@@ -1224,7 +1541,7 @@ class SearchService:
             group.group_id,
             product_id,
             app_name,
-            group.platform.value,
+            platform.value,
             group.group_type.value,
             group.entry.type,
             entry_url,
@@ -1236,6 +1553,9 @@ class SearchService:
         connection.commit()
     except Exception as exc:
       logger.warning('Failed to mark group viewed: %s', exc)
+      return
+
+    self._sync_viewed_exports_safely()
 
   def manual_upload_group(
     self,
@@ -1267,17 +1587,19 @@ class SearchService:
     if normalized_entry_type == 'qrcode' and not qrcode_bytes:
       raise ValueError('qrcode_file is required when entry_type is qrcode')
 
+    canonical_platform = self._canonicalize_platform(platform)
+
     image_path: str | None = None
     if normalized_entry_type == 'qrcode' and qrcode_bytes:
       image_path = self._save_qr_code(
         image_bytes=qrcode_bytes,
-        platform=platform,
+        platform=canonical_platform,
         repo_name=normalized_app_name,
         content_type=qrcode_content_type,
       )
 
     identity = image_path or normalized_entry_url or normalized_fallback or normalized_app_name.lower()
-    stable_seed = f'manual:{normalized_app_name.lower()}:{platform.value}:{normalized_entry_type}:{identity}'
+    stable_seed = f'manual:{normalized_app_name.lower()}:{canonical_platform.value}:{normalized_entry_type}:{identity}'
     view_key = hashlib.sha1(stable_seed.encode('utf-8')).hexdigest()[:16]
     product_id = hashlib.sha1(f'manual:{normalized_app_name.lower()}'.encode('utf-8')).hexdigest()[:12]
 
@@ -1323,7 +1645,7 @@ class SearchService:
             normalized_description,
             normalized_created_at,
             normalized_stars,
-            platform.value,
+            canonical_platform.value,
             group_type.value,
             normalized_entry_type,
             normalized_entry_url,
@@ -1362,7 +1684,7 @@ class SearchService:
             view_key,
             product_id,
             normalized_app_name,
-            platform.value,
+            canonical_platform.value,
             group_type.value,
             normalized_entry_type,
             normalized_entry_url,
@@ -1376,6 +1698,7 @@ class SearchService:
       logger.warning('Failed to write manual upload: %s', exc)
       raise ValueError('manual upload failed') from exc
 
+    self._sync_viewed_exports_safely()
     return view_key
 
   def remove_viewed_group(self, view_key: str) -> None:
@@ -1390,6 +1713,9 @@ class SearchService:
         connection.commit()
     except Exception as exc:
       logger.warning('Failed to remove viewed group: %s', exc)
+      return
+
+    self._sync_viewed_exports_safely()
 
   def list_viewed_groups(self) -> list[ViewedGroupItem]:
     try:
@@ -1417,12 +1743,17 @@ class SearchService:
 
     items: list[ViewedGroupItem] = []
     normalized_image_updates: list[tuple[str, str]] = []
+    canonical_platform_updates: list[tuple[str, Platform]] = []
     for row in rows:
       try:
-        platform = Platform(str(row['platform']))
+        raw_platform = Platform(str(row['platform']))
         group_type = GroupType(str(row['group_type']))
       except ValueError:
         continue
+      platform = self._canonicalize_platform(raw_platform)
+      view_key = str(row['view_key'])
+      if platform != raw_platform:
+        canonical_platform_updates.append((view_key, platform))
 
       entry_type = str(row['entry_type'])
       if entry_type == 'qrcode':
@@ -1435,7 +1766,7 @@ class SearchService:
           platform=platform,
         )
         if normalized_path != image_path:
-          normalized_image_updates.append((str(row['view_key']), normalized_path))
+          normalized_image_updates.append((view_key, normalized_path))
         entry = QRCodeEntry(
           type='qrcode',
           image_path=normalized_path,
@@ -1460,7 +1791,7 @@ class SearchService:
 
       items.append(
         ViewedGroupItem(
-          view_key=str(row['view_key']),
+          view_key=view_key,
           product_id=str(row['product_id']),
           app_name=str(row['app_name']),
           platform=platform,
@@ -1471,6 +1802,9 @@ class SearchService:
       )
 
     self._update_viewed_group_image_paths(normalized_image_updates)
+    self._update_viewed_group_platforms(canonical_platform_updates)
+    if normalized_image_updates or canonical_platform_updates:
+      self._sync_viewed_exports_safely()
     return items
 
   # -------------------------------------------------------------------------
@@ -1562,6 +1896,7 @@ class SearchService:
       title=title,
       text=soup.get_text(' ', strip=True)[:2000],
       fetch_method='http',
+      soup=soup,
     )
 
   def _collect_relevant_links(
@@ -1569,7 +1904,7 @@ class SearchService:
     page: FetchedPage,
     candidate: GitHubRepositoryCandidate,
   ) -> list[str]:
-    soup = BeautifulSoup(page.html, 'html.parser')
+    soup = page.soup or BeautifulSoup(page.html, 'html.parser')
     page_host = self._domain_key(page.final_url)
     allowed_hosts = {page_host} if page_host else set()
     candidate_repo_host = self._domain_key(candidate.repo_url)
@@ -1743,22 +2078,23 @@ class SearchService:
     return list(deduped.values())
 
   def _group_signature(self, group: ExtractedGroupCandidate) -> str:
+    canonical_platform = self._canonicalize_platform(group.platform)
     if group.qq_number and group.platform == Platform.QQ:
-      return f'{group.platform.value}:qq:{group.qq_number}'
+      return f'{canonical_platform.value}:qq:{group.qq_number}'
 
     if group.image_bytes:
       digest = hashlib.sha1(group.image_bytes).hexdigest()
-      return f'{group.platform.value}:image:{digest}'
+      return f'{canonical_platform.value}:image:{digest}'
 
     normalized_link = self._normalize_group_link(
       group.entry_url or group.fallback_url or group.decoded_payload or '',
       group.platform,
     )
     if normalized_link:
-      return f'{group.platform.value}:link:{normalized_link}'
+      return f'{canonical_platform.value}:link:{normalized_link}'
 
     fallback = group.image_url or group.source_url
-    return f'{group.platform.value}:fallback:{fallback}'
+    return f'{canonical_platform.value}:fallback:{fallback}'
 
   def _normalize_group_link(self, link: str, platform: Platform | None = None) -> str:
     if not link:
@@ -1852,30 +2188,32 @@ class SearchService:
     for group in groups:
       if len(official_groups) >= MAX_GROUPS_PER_CARD:
         break
+      raw_platform = group.platform
+      canonical_platform = self._canonicalize_platform(raw_platform)
 
       stored_path = ''
       if group.image_bytes and group.qrcode_verified:
         stored_path = self._save_qr_code(
           group.image_bytes,
-          group.platform,
+          canonical_platform,
           candidate.repo_name,
           group.image_content_type,
         )
 
-      if group.platform == Platform.QQ and group.qq_number:
+      if raw_platform == Platform.QQ and group.qq_number:
         entry = QQNumberEntry(type='qq_number', qq_number=group.qq_number)
-        group_identity = f'{group.platform.value}:qq:{group.qq_number}'
+        group_identity = f'{canonical_platform.value}:qq:{group.qq_number}'
       elif stored_path:
         entry = QRCodeEntry(
           type='qrcode',
           image_path=stored_path,
           fallback_url=group.entry_url or group.fallback_url,
         )
-        group_identity = f'{group.platform.value}:qrcode:{stored_path}'
-      elif group.entry_url and self._is_reliable_group_link(group.entry_url, group.platform):
+        group_identity = f'{canonical_platform.value}:qrcode:{stored_path}'
+      elif group.entry_url and self._is_reliable_group_link(group.entry_url, raw_platform):
         entry = LinkEntry(type='link', url=group.entry_url)
-        normalized = self._normalize_group_link(group.entry_url, group.platform) or group.entry_url
-        group_identity = f'{group.platform.value}:link:{normalized}'
+        normalized = self._normalize_group_link(group.entry_url, raw_platform) or group.entry_url
+        group_identity = f'{canonical_platform.value}:link:{normalized}'
       else:
         continue
 
@@ -1885,7 +2223,7 @@ class SearchService:
       official_groups.append(
         OfficialGroup(
           group_id=group_id,
-          platform=group.platform,
+          platform=canonical_platform,
           group_type=group.group_type or GroupType.UNKNOWN,
           entry=entry,
           is_added=False,
@@ -1927,7 +2265,7 @@ class SearchService:
         ext = 'svg'
 
     safe_name = self._safe_qrcode_name(repo_name, fallback='repo')
-    safe_platform = self._safe_qrcode_name(platform.value, fallback='platform')
+    safe_platform = self._safe_qrcode_name(self._canonicalize_platform(platform).value, fallback='platform')
     digest = hashlib.sha1(image_bytes).hexdigest()[:8]
     filename = f'{safe_name}_{safe_platform}_{digest}.{ext}'
     destination = self.settings.qrcode_dir / filename

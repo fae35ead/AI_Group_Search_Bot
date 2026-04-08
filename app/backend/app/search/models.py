@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
 
+from bs4 import BeautifulSoup
+
 from app.api.schemas import GroupType, Platform
 
 
@@ -34,6 +36,7 @@ class FetchedPage:
   title: str
   text: str
   fetch_method: str = 'http'
+  soup: BeautifulSoup | None = None
 
 
 @dataclass(frozen=True)

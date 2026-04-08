@@ -16,6 +16,9 @@ class Settings:
   data_dir: Path
   public_dir: Path
   qrcode_dir: Path
+  viewed_dir: Path
+  viewed_qrcode_dir: Path
+  viewed_links_csv_path: Path
   database_path: Path
   cors_origins: tuple[str, ...]
   playwright_install_dir: Path
@@ -41,6 +44,9 @@ def get_settings() -> Settings:
   data_dir = backend_root / 'data'
   public_dir = data_dir / 'public'
   qrcode_dir = public_dir / 'qrcodes'
+  viewed_dir = data_dir / 'viewed'
+  viewed_qrcode_dir = viewed_dir / 'qrcodes'
+  viewed_links_csv_path = viewed_dir / 'viewed_links.csv'
   database_path = data_dir / 'ai-group-discovery.sqlite3'
   playwright_install_dir = Path.home() / 'AppData' / 'Local' / 'ms-playwright'
 
@@ -50,6 +56,9 @@ def get_settings() -> Settings:
     data_dir=data_dir,
     public_dir=public_dir,
     qrcode_dir=qrcode_dir,
+    viewed_dir=viewed_dir,
+    viewed_qrcode_dir=viewed_qrcode_dir,
+    viewed_links_csv_path=viewed_links_csv_path,
     database_path=database_path,
     cors_origins=('http://127.0.0.1:5173', 'http://localhost:5173'),
     playwright_install_dir=playwright_install_dir,

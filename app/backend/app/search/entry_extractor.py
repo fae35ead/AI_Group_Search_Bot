@@ -1,5 +1,7 @@
 import base64
 import re
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from urllib.parse import urljoin, unquote, urlparse
 
 import cv2
@@ -187,6 +189,7 @@ QQ_SCAN_MAX_LINES = 160
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.svg')
 MAX_CANDIDATES_PER_PAGE = 30
 MAX_VISUAL_ATTEMPTS_PER_PAGE = 12
+MAX_VISUAL_TASK_WORKERS = 4
 MIN_IMAGE_SIZE = 180
 MIN_SMALL_QR_IMAGE_SIZE = 160
 MIN_VISUAL_SIZE = 400
@@ -236,6 +239,14 @@ NOISE_LINK_HOSTS = {
 }
 
 
+@dataclass(frozen=True)
+class VisualCandidateTask:
+  order: int
+  image_url: str
+  page_url: str
+  full_context: str
+  entry_url: str | None
+
 
 class EntryExtractor:
   def __init__(self, settings: Settings):
@@ -257,10 +268,12 @@ class EntryExtractor:
       if candidate_count >= MAX_CANDIDATES_PER_PAGE:
         break
 
-      soup = BeautifulSoup(page.html, 'html.parser')
-      readme_blocks = self._find_readme_blocks(soup)
-      blocks = readme_blocks or [soup]
+      soup = page.soup or BeautifulSoup(page.html, 'html.parser')
+      blocks = self._select_scan_blocks(soup, page.final_url)
       visual_attempts = 0
+      ordered_candidates: list[tuple[int, ExtractedGroupCandidate]] = []
+      visual_tasks: list[VisualCandidateTask] = []
+      next_order = 0
 
       for block in blocks:
         if candidate_count >= MAX_CANDIDATES_PER_PAGE:
@@ -272,46 +285,75 @@ class EntryExtractor:
           reverse=True,
         )
         for image in images:
-          if candidate_count >= MAX_CANDIDATES_PER_PAGE or visual_attempts >= MAX_VISUAL_ATTEMPTS_PER_PAGE:
+          if visual_attempts >= MAX_VISUAL_ATTEMPTS_PER_PAGE:
             break
           nearby = self._collect_nearby_text(image)
-          if not self._should_try_image_tag(image, page.final_url, nearby):
+          task = self._build_visual_task_from_img_tag(
+            image,
+            page.final_url,
+            context=nearby,
+            order=next_order,
+          )
+          if task is None:
             continue
-          candidate = self._extract_from_img_tag(image, page.final_url, context=nearby)
+          visual_tasks.append(task)
           visual_attempts += 1
-          if candidate:
-            candidates.append(candidate)
-            candidate_count += 1
+          next_order += 1
 
         for link in block.find_all('a', href=True):
-          if candidate_count >= MAX_CANDIDATES_PER_PAGE:
-            break
           nearby = self._collect_nearby_text(link)
           absolute_link = urljoin(page.final_url, link.get('href', ''))
           is_image_link = self._looks_like_image_url(absolute_link)
           if is_image_link and visual_attempts >= MAX_VISUAL_ATTEMPTS_PER_PAGE:
             continue
-          candidate = self._extract_from_link_tag(link, page.final_url, context=nearby)
-          if candidate:
-            if candidate.image_bytes is not None:
-              visual_attempts += 1
-            candidates.append(candidate)
-            candidate_count += 1
+          if is_image_link:
+            task = self._build_visual_task_from_link_tag(
+              link,
+              page.final_url,
+              context=nearby,
+              order=next_order,
+            )
+            if task is None:
+              continue
+            visual_tasks.append(task)
+            visual_attempts += 1
+            next_order += 1
+            continue
 
-        if candidate_count >= MAX_CANDIDATES_PER_PAGE:
-          continue
+          candidate = self._extract_non_visual_link_candidate(link, page.final_url, context=nearby)
+          if candidate:
+            ordered_candidates.append((next_order, candidate))
+            next_order += 1
 
         for candidate in self._extract_qq_number_candidates(block, page.final_url):
-          if candidate_count >= MAX_CANDIDATES_PER_PAGE:
-            break
-          candidates.append(candidate)
-          candidate_count += 1
+          ordered_candidates.append((next_order, candidate))
+          next_order += 1
+
+      ordered_candidates.extend(self._extract_visual_candidates(visual_tasks))
+      ordered_candidates.sort(key=lambda item: item[0])
+      for _, candidate in ordered_candidates:
+        if candidate_count >= MAX_CANDIDATES_PER_PAGE:
+          break
+        candidates.append(candidate)
+        candidate_count += 1
 
     return candidates
 
   # -------------------------------------------------------------------------
   # README / context helpers
   # -------------------------------------------------------------------------
+
+  def _select_scan_blocks(self, soup: BeautifulSoup, page_url: str) -> list[Tag | BeautifulSoup]:
+    # Keep GitHub extraction focused on README areas to avoid noisy global navigation links.
+    if self._is_github_page(page_url):
+      readme_blocks = self._find_readme_blocks(soup)
+      return readme_blocks or [soup]
+    # For official websites, scan the full page to cover footer/community QR areas.
+    return [soup]
+
+  def _is_github_page(self, page_url: str) -> bool:
+    host = urlparse(page_url).netloc.lower().removeprefix('www.')
+    return host == 'github.com'
 
   def _find_readme_blocks(self, soup: BeautifulSoup) -> list[Tag]:
     blocks: list[Tag] = []
@@ -358,6 +400,10 @@ class EntryExtractor:
         parent_text = parent.get_text(' ', strip=True)
         if parent_text:
           parts.append(parent_text[:300])
+      else:
+        local_context = self._collect_local_nearby_text(tag, parent=parent)
+        if local_context:
+          parts.append(local_context)
 
     sibling_heading = tag.find_previous(['h1', 'h2', 'h3', 'h4', 'strong'])
     if sibling_heading:
@@ -366,6 +412,64 @@ class EntryExtractor:
         parts.append(heading_text[:120])
 
     return ' '.join(parts)
+
+  def _collect_local_nearby_text(self, tag: Tag, *, parent: Tag) -> str:
+    snippets: list[str] = []
+
+    next_text = self._extract_first_sibling_text_snippet(tag, direction='next')
+    previous_text = self._extract_first_sibling_text_snippet(tag, direction='previous')
+    if next_text:
+      snippets.append(next_text)
+    elif previous_text:
+      snippets.append(previous_text)
+
+    if parent is not tag:
+      parent_next_text = self._extract_first_sibling_text_snippet(parent, direction='next')
+      parent_previous_text = self._extract_first_sibling_text_snippet(parent, direction='previous')
+      if parent_next_text:
+        snippets.append(parent_next_text)
+      elif parent_previous_text:
+        snippets.append(parent_previous_text)
+
+    deduped = [snippet for snippet in dict.fromkeys(snippets) if snippet]
+    return ' '.join(deduped)
+
+  def _extract_first_sibling_text_snippet(
+    self,
+    tag: Tag,
+    *,
+    direction: str,
+    max_steps: int = 5,
+  ) -> str:
+    if direction not in {'next', 'previous'}:
+      return ''
+
+    current = tag.next_sibling if direction == 'next' else tag.previous_sibling
+    steps = 0
+    while current is not None and steps < max_steps:
+      steps += 1
+      text = self._extract_node_text_snippet(current)
+      if text:
+        return text
+
+      if isinstance(current, Tag) and current.name in {'img', 'picture', 'svg'}:
+        break
+
+      current = current.next_sibling if direction == 'next' else current.previous_sibling
+
+    return ''
+
+  def _extract_node_text_snippet(self, node: object, *, max_chars: int = 160) -> str:
+    if isinstance(node, Tag):
+      if node.name in {'script', 'style', 'img', 'picture', 'svg'}:
+        return ''
+      text = node.get_text(' ', strip=True)
+    else:
+      text = str(node).strip()
+
+    if not text:
+      return ''
+    return text[:max_chars]
 
   def _collect_anchor_image_signals(self, anchor: Tag) -> str:
     parts: list[str] = []
@@ -471,31 +575,10 @@ class EntryExtractor:
     page_url: str,
     context: str = '',
   ) -> ExtractedGroupCandidate | None:
-    src = self._resolve_image_source(tag)
-    if not src:
+    task = self._build_visual_task_from_img_tag(tag, page_url, context=context, order=0)
+    if task is None:
       return None
-
-    image_url = urljoin(page_url, src)
-    nearest_link = self._find_nearest_link(tag, page_url)
-    full_context = f'{context} {nearest_link or ""} {image_url}'.strip()
-    resolved_url = self._resolve_camo_url(image_url)
-
-    if not self._should_consider_visual_candidate(resolved_url, full_context, nearest_link):
-      return None
-
-    content = self._download_image(image_url)
-    if content is None:
-      return None
-    image_bytes, content_type = content
-
-    return self._extract_visual_candidate(
-      image_url=image_url,
-      page_url=page_url,
-      full_context=full_context,
-      image_bytes=image_bytes,
-      content_type=content_type,
-      entry_url=nearest_link,
-    )
+    return self._extract_visual_task(task, self._download_image(task.image_url))
 
   # -------------------------------------------------------------------------
   # Link extraction
@@ -520,23 +603,141 @@ class EntryExtractor:
       return None
 
     if self._looks_like_image_url(absolute):
-      resolved_url = self._resolve_camo_url(absolute)
-      if not self._should_consider_visual_candidate(resolved_url, full_context, None):
+      task = self._build_visual_task_from_link_tag(tag, page_url, context=context, order=0)
+      if task is None:
         return None
+      return self._extract_visual_task(task, self._download_image(task.image_url))
 
-      content = self._download_image(absolute)
-      if content is None:
-        return None
-      image_bytes, content_type = content
+    return self._extract_non_visual_link_candidate(tag, page_url, context=context)
 
-      return self._extract_visual_candidate(
-        image_url=absolute,
-        page_url=page_url,
-        full_context=full_context,
-        image_bytes=image_bytes,
-        content_type=content_type,
-        entry_url=None,
-      )
+  def _build_visual_task_from_img_tag(
+    self,
+    tag: Tag,
+    page_url: str,
+    *,
+    context: str,
+    order: int,
+  ) -> VisualCandidateTask | None:
+    src = self._resolve_image_source(tag)
+    if not src:
+      return None
+
+    image_url = urljoin(page_url, src)
+    nearest_link = self._find_nearest_link(tag, page_url)
+    full_context = f'{context} {nearest_link or ""} {image_url}'.strip()
+    resolved_url = self._resolve_camo_url(image_url)
+    if not self._should_consider_visual_candidate(resolved_url, full_context, nearest_link):
+      return None
+
+    return VisualCandidateTask(
+      order=order,
+      image_url=image_url,
+      page_url=page_url,
+      full_context=full_context,
+      entry_url=nearest_link,
+    )
+
+  def _build_visual_task_from_link_tag(
+    self,
+    tag: Tag,
+    page_url: str,
+    *,
+    context: str,
+    order: int,
+  ) -> VisualCandidateTask | None:
+    href = tag.get('href')
+    if not href:
+      return None
+
+    absolute = urljoin(page_url, href)
+    own_text = tag.get_text(' ', strip=True)
+    anchor_image_signals = self._collect_anchor_image_signals(tag)
+    full_context = f'{own_text} {anchor_image_signals} {context} {absolute}'.strip()
+    platform = self._detect_platform(absolute, own_text, anchor_image_signals, context)
+    if platform is None or not self._looks_like_image_url(absolute):
+      return None
+
+    resolved_url = self._resolve_camo_url(absolute)
+    if not self._should_consider_visual_candidate(resolved_url, full_context, None):
+      return None
+
+    return VisualCandidateTask(
+      order=order,
+      image_url=absolute,
+      page_url=page_url,
+      full_context=full_context,
+      entry_url=None,
+    )
+
+  def _extract_visual_candidates(self, tasks: list[VisualCandidateTask]) -> list[tuple[int, ExtractedGroupCandidate]]:
+    if not tasks:
+      return []
+
+    unique_image_urls = list(dict.fromkeys(task.image_url for task in tasks))
+    downloaded_images = self._download_images(unique_image_urls)
+    results: list[tuple[int, ExtractedGroupCandidate]] = []
+    with ThreadPoolExecutor(max_workers=min(MAX_VISUAL_TASK_WORKERS, len(tasks))) as executor:
+      future_pairs = [
+        (task, executor.submit(self._extract_visual_task, task, downloaded_images.get(task.image_url)))
+        for task in tasks
+      ]
+      for task, future in future_pairs:
+        try:
+          candidate = future.result()
+        except Exception:
+          candidate = None
+        if candidate is not None:
+          results.append((task.order, candidate))
+    return results
+
+  def _download_images(self, image_urls: list[str]) -> dict[str, tuple[bytes, str] | None]:
+    if not image_urls:
+      return {}
+
+    downloaded: dict[str, tuple[bytes, str] | None] = {}
+    with ThreadPoolExecutor(max_workers=min(MAX_VISUAL_TASK_WORKERS, len(image_urls))) as executor:
+      future_pairs = [(image_url, executor.submit(self._download_image, image_url)) for image_url in image_urls]
+      for image_url, future in future_pairs:
+        try:
+          downloaded[image_url] = future.result()
+        except Exception:
+          downloaded[image_url] = None
+    return downloaded
+
+  def _extract_visual_task(
+    self,
+    task: VisualCandidateTask,
+    content: tuple[bytes, str] | None,
+  ) -> ExtractedGroupCandidate | None:
+    if content is None:
+      return None
+    image_bytes, content_type = content
+    return self._extract_visual_candidate(
+      image_url=task.image_url,
+      page_url=task.page_url,
+      full_context=task.full_context,
+      image_bytes=image_bytes,
+      content_type=content_type,
+      entry_url=task.entry_url,
+    )
+
+  def _extract_non_visual_link_candidate(
+    self,
+    tag: Tag,
+    page_url: str,
+    context: str = '',
+  ) -> ExtractedGroupCandidate | None:
+    href = tag.get('href')
+    if not href:
+      return None
+
+    absolute = urljoin(page_url, href)
+    own_text = tag.get_text(' ', strip=True)
+    anchor_image_signals = self._collect_anchor_image_signals(tag)
+    full_context = f'{own_text} {anchor_image_signals} {context} {absolute}'.strip()
+    platform = self._detect_platform(absolute, own_text, anchor_image_signals, context)
+    if platform is None:
+      return None
 
     resolved_group_link = self._resolve_group_link(absolute, platform)
     if resolved_group_link is None:

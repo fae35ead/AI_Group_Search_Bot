@@ -10,6 +10,9 @@ import type {
   SearchFilters,
   ViewedGroup,
 } from '../domain/types'
+import { canonicalizePlatform } from '../domain/platform'
+
+type ApiPlatform = Platform | '企业微信'
 
 interface SearchRequestDto {
   query: string
@@ -44,7 +47,7 @@ type GroupEntryDto = QRCodeEntryDto | LinkEntryDto | QQNumberEntryDto
 
 interface OfficialGroupDto {
   group_id: string
-  platform: Platform
+  platform: ApiPlatform
   group_type: GroupType
   entry: GroupEntryDto
   is_added: boolean
@@ -74,7 +77,7 @@ interface ViewedGroupDto {
   view_key: string
   product_id: string
   app_name: string
-  platform: Platform
+  platform: ApiPlatform
   group_type: GroupType
   entry: GroupEntryDto
   viewed_at: string
@@ -198,7 +201,7 @@ export async function fetchViewedGroups(): Promise<ViewedGroup[]> {
     viewKey: group.view_key,
     productId: group.product_id,
     appName: group.app_name,
-    platform: group.platform,
+    platform: canonicalizePlatform(group.platform),
     groupType: group.group_type,
     entry: mapEntry(group.entry),
     viewedAt: group.viewed_at,
@@ -320,7 +323,7 @@ function mapProductCard(card: ProductCardDto): ProductCard {
 function mapOfficialGroup(group: OfficialGroupDto): OfficialGroup {
   return {
     groupId: group.group_id,
-    platform: group.platform,
+    platform: canonicalizePlatform(group.platform),
     groupType: group.group_type,
     entry: mapEntry(group.entry),
     isAdded: group.is_added,

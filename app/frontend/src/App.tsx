@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+﻿import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { fetchHealth, type HealthPayload } from './api/health'
 import { fetchRecommendations, fetchViewedGroups, manualUploadGroup, markGroupViewed, removeViewedGroup, searchOfficialGroups } from './api/search'
 import { ResultCard } from './components/ResultCard'
+import { isUnknownGroupType } from './domain/groupDisplay'
+import { canonicalizePlatform } from './domain/platform'
 import type { GroupType, ManualEntryType, OfficialGroup, Platform, ProductCard, RecommendedTool, SearchFilters, ViewedGroup } from './domain/types'
 import './App.css'
 
@@ -59,7 +61,12 @@ function readViewedGroupsFromStorage(): ViewedGroup[] {
     if (!Array.isArray(parsed)) {
       return []
     }
-    return parsed.filter((item): item is ViewedGroup => typeof item?.viewKey === 'string')
+    return parsed
+      .filter((item): item is ViewedGroup => typeof item?.viewKey === 'string')
+      .map((item) => ({
+        ...item,
+        platform: canonicalizePlatform(item.platform as Platform | '企业微信'),
+      }))
   } catch {
     return []
   }
@@ -89,6 +96,8 @@ type ManualUploadFormState = {
   qrcodeFile: File | null
 }
 
+type SearchMode = 'initial' | 'expand' | 'verify'
+
 const PLATFORM_OPTIONS: Array<{ label: string; value: Platform }> = [
   { label: '微信', value: '\u5fae\u4fe1' },
   { label: 'QQ', value: 'QQ' },
@@ -96,6 +105,14 @@ const PLATFORM_OPTIONS: Array<{ label: string; value: Platform }> = [
   { label: 'Discord', value: 'Discord' },
   { label: '企业微信', value: '\u4f01\u4e1a\u5fae\u4fe1' },
   { label: '钉钉', value: '\u9489\u9489' },
+].filter((option) => option.value !== '\u4f01\u4e1a\u5fae\u4fe1') as Array<{ label: string; value: Platform }>
+
+const GROUP_PLATFORM_FILTER_OPTIONS: Array<{ label: string; value: Platform }> = [
+  { label: '微信群', value: '\u5fae\u4fe1' },
+  { label: 'QQ群', value: 'QQ' },
+  { label: '钉钉群', value: '\u9489\u9489' },
+  { label: '飞书群', value: '\u98de\u4e66' },
+  { label: 'Discord', value: 'Discord' },
 ]
 
 const GROUP_TYPE_OPTIONS: Array<{ label: string; value: GroupType }> = [
@@ -122,14 +139,14 @@ const INITIAL_MANUAL_FORM: ManualUploadFormState = {
 function App() {
   const [query, setQuery] = useState('')
   const [rawResults, setRawResults] = useState<ProductCard[]>([])
-  const [loading, setLoading] = useState(false)
-  const [verifying, setVerifying] = useState(false)
+  const [searchMode, setSearchMode] = useState<SearchMode | null>(null)
   const [emptyMessage, setEmptyMessage] = useState<string | null>(null)
   const [searchError, setSearchError] = useState<string | null>(null)
   const [health, setHealth] = useState<HealthPayload | null>(null)
   const [minStars, setMinStars] = useState('')
   const [createdAfter, setCreatedAfter] = useState('')
   const [createdBefore, setCreatedBefore] = useState('')
+  const [selectedGroupPlatforms, setSelectedGroupPlatforms] = useState<Platform[]>([])
   const [resultLimit, setResultLimit] = useState(10)
   const [recommendations, setRecommendations] = useState<RecommendedTool[]>([])
   const [refreshingRecommendations, setRefreshingRecommendations] = useState(false)
@@ -144,7 +161,14 @@ function App() {
   const [manualUploading, setManualUploading] = useState(false)
   const [manualUploadError, setManualUploadError] = useState<string | null>(null)
   const [manualForm, setManualForm] = useState<ManualUploadFormState>(INITIAL_MANUAL_FORM)
+  const [submittedQuery, setSubmittedQuery] = useState('')
   const activeSearchControllerRef = useRef<AbortController | null>(null)
+  const activeSearchRequestRef = useRef<{ query: string; limit: number; mode: SearchMode } | null>(null)
+  const lastCompletedSearchRef = useRef<{ query: string; limit: number } | null>(null)
+
+  const loading = searchMode === 'initial' || searchMode === 'expand'
+  const verifying = searchMode === 'verify'
+  const showInitialSkeleton = searchMode === 'initial'
 
   const displayedResults = useMemo(() => {
     let filtered = rawResults
@@ -172,8 +196,20 @@ function App() {
         })
       }
     }
-    return filtered
-  }, [rawResults, minStars, createdAfter, createdBefore])
+    if (selectedGroupPlatforms.length > 0) {
+      const selectedPlatforms = new Set(selectedGroupPlatforms)
+      filtered = filtered
+        .map((card) => {
+          const filteredGroups = card.groups.filter((group) => selectedPlatforms.has(group.platform))
+          if (filteredGroups.length === 0) {
+            return null
+          }
+          return filteredGroups.length === card.groups.length ? card : { ...card, groups: filteredGroups }
+        })
+        .filter((card): card is ProductCard => card !== null)
+    }
+    return filtered.slice(0, resultLimit)
+  }, [rawResults, minStars, createdAfter, createdBefore, selectedGroupPlatforms, resultLimit])
 
   const viewedGroupsByApp = useMemo(() => {
     const buckets = new Map<string, { key: string; productId: string; appName: string; groups: ViewedGroup[] }>()
@@ -269,9 +305,45 @@ function App() {
   }, [viewedGroups])
 
   useEffect(() => {
+    const activeRequest = activeSearchRequestRef.current
+    if (!activeRequest || activeRequest.mode !== 'expand') {
+      return
+    }
+    if (resultLimit >= activeRequest.limit) {
+      return
+    }
+    activeSearchControllerRef.current?.abort()
+  }, [resultLimit])
+
+  useEffect(() => {
+    const trimmedSubmittedQuery = submittedQuery.trim()
+    if (!trimmedSubmittedQuery || searchMode !== null) {
+      return
+    }
+    if (resultLimit <= rawResults.length) {
+      return
+    }
+
+    const lastCompletedSearch = lastCompletedSearchRef.current
+    if (!lastCompletedSearch || lastCompletedSearch.query !== trimmedSubmittedQuery) {
+      return
+    }
+    if (lastCompletedSearch.limit >= resultLimit) {
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      void runSearch(trimmedSubmittedQuery, 'expand', resultLimit)
+    }, 400)
+
+    return () => window.clearTimeout(timer)
+  }, [rawResults.length, resultLimit, searchMode, submittedQuery])
+
+  useEffect(() => {
     return () => {
       activeSearchControllerRef.current?.abort()
       activeSearchControllerRef.current = null
+      activeSearchRequestRef.current = null
     }
   }, [])
 
@@ -290,35 +362,37 @@ function App() {
     return Object.keys(filters).length > 0 ? filters : undefined
   }
 
-  async function runSearch(trimmedQuery: string, refresh: boolean) {
+  async function runSearch(trimmedQuery: string, mode: SearchMode, requestedLimit = resultLimit) {
     activeSearchControllerRef.current?.abort()
     const controller = new AbortController()
     activeSearchControllerRef.current = controller
+    activeSearchRequestRef.current = { query: trimmedQuery, limit: requestedLimit, mode }
 
     setSearchError(null)
-    if (refresh) {
-      setVerifying(true)
-      setLoading(false)
-    } else {
-      setLoading(true)
-      setVerifying(false)
+    setSearchMode(mode)
+    if (mode !== 'verify') {
+      setSubmittedQuery(trimmedQuery)
+    }
+    if (mode === 'initial') {
       setQuery(trimmedQuery)
     }
 
+    let aborted = false
     try {
       const response = await searchOfficialGroups(trimmedQuery, buildFilters(), {
-        refresh,
+        refresh: mode === 'verify',
         signal: controller.signal,
-        limit: resultLimit,
+        limit: requestedLimit,
       })
       const unique = Array.from(new Map(response.results.map((card) => [card.productId, card])).values())
       setRawResults(unique)
       setEmptyMessage(response.emptyMessage)
     } catch (error) {
       if (isAbortError(error)) {
+        aborted = true
         return
       }
-      if (!refresh) {
+      if (mode === 'initial') {
         setRawResults([])
         setEmptyMessage(null)
         setSearchError(
@@ -331,10 +405,10 @@ function App() {
       const isLatest = activeSearchControllerRef.current === controller
       if (isLatest) {
         activeSearchControllerRef.current = null
-        if (refresh) {
-          setVerifying(false)
-        } else {
-          setLoading(false)
+        activeSearchRequestRef.current = null
+        setSearchMode(null)
+        if (!aborted && mode !== 'verify') {
+          lastCompletedSearchRef.current = { query: trimmedQuery, limit: requestedLimit }
         }
       }
     }
@@ -350,14 +424,14 @@ function App() {
       return
     }
 
-    await runSearch(trimmed, false)
+    await runSearch(trimmed, 'initial')
   }
 
   async function handleVerify() {
-    const trimmed = query.trim()
+    const trimmed = submittedQuery.trim() || query.trim()
     if (!trimmed || rawResults.length === 0) return
 
-    await runSearch(trimmed, true)
+    await runSearch(trimmed, 'verify')
   }
 
   async function handleMarkViewed(card: ProductCard, group: OfficialGroup) {
@@ -514,6 +588,12 @@ function App() {
     setExpandedResultCards((prev) => (prev.includes(productId) ? prev.filter((id) => id !== productId) : [...prev, productId]))
   }
 
+  function toggleGroupPlatform(platform: Platform) {
+    setSelectedGroupPlatforms((prev) =>
+      prev.includes(platform) ? prev.filter((item) => item !== platform) : [...prev, platform],
+    )
+  }
+
   async function handleCopyQQNumber(qqNumber: string) {
     try {
       await navigator.clipboard.writeText(qqNumber)
@@ -566,11 +646,11 @@ function App() {
                 onChange={(event) => setQuery(event.target.value)}
                 placeholder="例如 ChatGPT、FastGPT、n8n、cursor.com、github.com/labring/FastGPT"
               />
-              <button className="action-button primary" disabled={loading} type="submit">
+              <button className="action-button primary" disabled={loading || verifying} type="submit">
                 {loading ? '搜索中…' : '搜索'}
               </button>
               <button
-                disabled={rawResults.length === 0}
+                disabled={rawResults.length === 0 || loading || verifying}
                 onClick={() => void handleVerify()}
                 className="action-button secondary"
                 type="button"
@@ -581,57 +661,87 @@ function App() {
           </form>
 
           <div className="filter-row filter-row-compact">
-            <label className="filter-label" htmlFor="filter-min-stars">
-              最低星级
-            </label>
-            <input
-              id="filter-min-stars"
-              className="filter-input"
-              type="number"
-              min="0"
-              placeholder="例如 50"
-              value={minStars}
-              onChange={(event) => setMinStars(event.target.value)}
-            />
-            <label className="filter-label" htmlFor="filter-created-after">
-              创建时间
-            </label>
-            <div className="date-input-wrap">
+            <div className="filter-group filter-group-stars">
+              <label className="filter-label" htmlFor="filter-min-stars">
+                最低星级
+              </label>
               <input
-                id="filter-created-after"
-                className={`filter-input filter-date-input${createdAfter ? '' : ' empty'}`}
-                type="date"
-                value={createdAfter}
-                onChange={(event) => setCreatedAfter(event.target.value)}
+                id="filter-min-stars"
+                className="filter-input filter-input-compact"
+                type="number"
+                min="0"
+                placeholder="例如 50"
+                value={minStars}
+                onChange={(event) => setMinStars(event.target.value)}
               />
-              {!createdAfter ? <span className="date-input-overlay">年/月/日</span> : null}
             </div>
-            <span className="filter-sep">至</span>
-            <div className="date-input-wrap">
-              <input
-                id="filter-created-before"
-                className={`filter-input filter-date-input${createdBefore ? '' : ' empty'}`}
-                type="date"
-                value={createdBefore}
-                onChange={(event) => setCreatedBefore(event.target.value)}
-              />
-              {!createdBefore ? <span className="date-input-overlay">年/月/日</span> : null}
+
+            <div className="filter-group filter-group-dates">
+              <label className="filter-label" htmlFor="filter-created-after">
+                创建时间
+              </label>
+              <div className="filter-date-range">
+                <div className="date-input-wrap">
+                  <input
+                    id="filter-created-after"
+                    className={`filter-input filter-date-input${createdAfter ? '' : ' empty'}`}
+                    type="date"
+                    value={createdAfter}
+                    onChange={(event) => setCreatedAfter(event.target.value)}
+                  />
+                  {!createdAfter ? <span className="date-input-overlay">年/月/日</span> : null}
+                </div>
+                <span className="filter-sep">至</span>
+                <div className="date-input-wrap">
+                  <input
+                    id="filter-created-before"
+                    className={`filter-input filter-date-input${createdBefore ? '' : ' empty'}`}
+                    type="date"
+                    value={createdBefore}
+                    onChange={(event) => setCreatedBefore(event.target.value)}
+                  />
+                  {!createdBefore ? <span className="date-input-overlay">年/月/日</span> : null}
+                </div>
+              </div>
             </div>
-            <label className="filter-label" htmlFor="filter-result-limit">
-              返回数量
-            </label>
-            <div className="result-limit-control">
-              <input
-                id="filter-result-limit"
-                className="filter-range"
-                type="range"
-                min="3"
-                max="50"
-                step="1"
-                value={resultLimit}
-                onChange={(event) => setResultLimit(parseInt(event.target.value, 10))}
-              />
-              <span className="filter-value">{resultLimit}</span>
+
+            <div className="filter-group filter-group-platforms">
+              <span className="filter-label">群聊平台</span>
+              <div className="platform-filter-list" role="group" aria-label="群聊平台筛选">
+                {GROUP_PLATFORM_FILTER_OPTIONS.map((option) => {
+                  const isSelected = selectedGroupPlatforms.includes(option.value)
+                  return (
+                    <button
+                      key={option.value}
+                      aria-pressed={isSelected}
+                      className={`platform-filter-chip${isSelected ? ' active' : ''}`}
+                      onClick={() => toggleGroupPlatform(option.value)}
+                      type="button"
+                    >
+                      {option.label}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+
+            <div className="filter-group filter-group-limit">
+              <label className="filter-label" htmlFor="filter-result-limit">
+                返回数量
+              </label>
+              <div className="result-limit-control">
+                <input
+                  id="filter-result-limit"
+                  className="filter-range"
+                  type="range"
+                  min="3"
+                  max="50"
+                  step="1"
+                  value={resultLimit}
+                  onChange={(event) => setResultLimit(parseInt(event.target.value, 10))}
+                />
+                <span className="filter-value">{resultLimit}</span>
+              </div>
             </div>
           </div>
 
@@ -829,7 +939,9 @@ function App() {
                               <div className="viewed-group-head">
                                 <div className="group-tags">
                                   <span className="tag">{group.platform}</span>
-                                  <span className="tag muted">{group.groupType}</span>
+                                  {!isUnknownGroupType(group.groupType) ? (
+                                    <span className="tag muted">{group.groupType}</span>
+                                  ) : null}
                                 </div>
                                 <button
                                   className="source-link viewed-remove"
@@ -882,7 +994,7 @@ function App() {
         </section>
 
         <section className="results-section section-intro" style={{ '--i': 4 } as React.CSSProperties}>
-          {displayedResults.length > 0 ? (
+          {!showInitialSkeleton && displayedResults.length > 0 ? (
             <div className="results-overview" aria-live="polite">
               <div>
                 <p className="results-eyebrow">搜索结果</p>
@@ -897,7 +1009,7 @@ function App() {
             </div>
           ) : null}
 
-          {loading ? (
+          {showInitialSkeleton ? (
             <div className="skeleton-grid" aria-label="搜索加载中">
               {Array.from({ length: 3 }).map((_, index) => (
                 <article className="skeleton-card" key={index}>
@@ -924,7 +1036,7 @@ function App() {
             </section>
           ) : null}
 
-          {!loading && !emptyMessage && displayedResults.length > 0 ? (
+          {!showInitialSkeleton && !emptyMessage && displayedResults.length > 0 ? (
             <div className="results-grid search-engine-grid">
               {displayedResults.map((card, index) => (
                 <ResultCard
@@ -946,7 +1058,7 @@ function App() {
           {!loading && !emptyMessage && !searchError && rawResults.length > 0 && displayedResults.length === 0 ? (
             <section className="panel empty-state">
               <h2>筛选后无结果</h2>
-              <p>当前筛选条件下没有匹配的 AI 工具，可以调整星级或时间范围后再试。</p>
+              <p>当前筛选条件下没有匹配的 AI 工具，可以调整星级、时间范围或群聊平台后再试。</p>
             </section>
           ) : null}
 

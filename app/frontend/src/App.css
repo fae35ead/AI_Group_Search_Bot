@@ -217,14 +217,84 @@
   color: var(--muted);
 }
 
+.filter-group {
+  display: grid;
+  gap: 6px;
+  align-items: start;
+}
+
+.filter-group-stars {
+  flex: 0 0 auto;
+}
+
+.filter-group-dates {
+  flex: 0 1 auto;
+}
+
+.filter-group-limit {
+  flex: 0 0 auto;
+}
+
+.filter-group-platforms {
+  flex: 1 1 100%;
+}
+
+.platform-filter-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.platform-filter-chip {
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid rgba(60, 74, 64, 0.2);
+  border-radius: 999px;
+  background: rgba(249, 246, 240, 0.9);
+  color: var(--heading);
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    transform 180ms var(--ease-out-quart),
+    border-color 180ms var(--ease-out-quart),
+    background-color 180ms var(--ease-out-quart),
+    color 180ms var(--ease-out-quart);
+}
+
+.platform-filter-chip:hover {
+  border-color: rgba(46, 99, 67, 0.42);
+  background: rgba(232, 243, 236, 0.9);
+}
+
+.platform-filter-chip.active {
+  border-color: rgba(46, 99, 67, 0.7);
+  background: linear-gradient(130deg, rgba(77, 124, 94, 0.15), rgba(46, 99, 67, 0.08));
+  color: #204a34;
+}
+
 .filter-input {
   min-height: 42px;
   padding-inline: 12px;
 }
 
+.filter-input-compact {
+  width: 112px;
+}
+
 .filter-range {
   width: 140px;
   accent-color: #2e6343;
+}
+
+.filter-date-range {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .filter-sep,
@@ -941,7 +1011,8 @@
 .expand-toggle:focus-visible,
 .manual-upload-toggle:focus-visible,
 .viewed-toggle:focus-visible,
-.recommendation-tag:focus-visible {
+.recommendation-tag:focus-visible,
+.platform-filter-chip:focus-visible {
   outline: 3px solid rgba(77, 124, 94, 0.24);
   outline-offset: 2px;
 }
@@ -1012,6 +1083,14 @@
 
   .filter-row {
     align-items: flex-start;
+  }
+
+  .filter-group-dates {
+    flex-basis: 100%;
+  }
+
+  .filter-group-platforms {
+    flex-basis: 100%;
   }
 
   .manual-grid {
@@ -1095,11 +1174,23 @@
     width: 100%;
   }
 
+  .filter-group,
   .date-input-wrap,
   .result-limit-control {
     width: 100%;
   }
 
+  .platform-filter-list {
+    width: 100%;
+  }
+
+  .filter-date-range {
+    width: 100%;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .filter-input-compact,
   .filter-date-input,
   .filter-range {
     width: 100%;

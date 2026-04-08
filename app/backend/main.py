@@ -18,6 +18,8 @@ async def lifespan(_: FastAPI):
   initialize_database(settings.database_path)
   settings.public_dir.mkdir(parents=True, exist_ok=True)
   settings.qrcode_dir.mkdir(parents=True, exist_ok=True)
+  settings.viewed_dir.mkdir(parents=True, exist_ok=True)
+  settings.viewed_qrcode_dir.mkdir(parents=True, exist_ok=True)
   yield
 
 

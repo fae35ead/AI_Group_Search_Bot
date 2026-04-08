@@ -1,6 +1,10 @@
+import csv
+from dataclasses import replace
 import hashlib
 import json
 from datetime import datetime, timezone
+from pathlib import Path
+from tempfile import mkdtemp
 import time
 import unittest
 from unittest.mock import patch
@@ -33,15 +37,50 @@ def make_image_bytes(width: int, height: int) -> bytes:
 
 class SearchServiceTests(unittest.TestCase):
   def setUp(self):
-    settings = get_settings()
+    base_settings = get_settings()
+    temp_root = Path(mkdtemp())
+    temp_data_dir = temp_root / 'data'
+    temp_public_dir = temp_data_dir / 'public'
+    temp_qrcode_dir = temp_public_dir / 'qrcodes'
+    temp_viewed_dir = temp_data_dir / 'viewed'
+    temp_viewed_qrcode_dir = temp_viewed_dir / 'qrcodes'
+    temp_viewed_links_csv_path = temp_viewed_dir / 'viewed_links.csv'
+    temp_database_path = temp_data_dir / 'ai-group-discovery.sqlite3'
+    settings = replace(
+      base_settings,
+      data_dir=temp_data_dir,
+      public_dir=temp_public_dir,
+      qrcode_dir=temp_qrcode_dir,
+      viewed_dir=temp_viewed_dir,
+      viewed_qrcode_dir=temp_viewed_qrcode_dir,
+      viewed_links_csv_path=temp_viewed_links_csv_path,
+      database_path=temp_database_path,
+    )
     initialize_database(settings.database_path)
+    settings.public_dir.mkdir(parents=True, exist_ok=True)
+    settings.qrcode_dir.mkdir(parents=True, exist_ok=True)
+    settings.viewed_dir.mkdir(parents=True, exist_ok=True)
+    settings.viewed_qrcode_dir.mkdir(parents=True, exist_ok=True)
     with get_connection(settings.database_path) as connection:
       connection.execute('DELETE FROM search_cache')
       connection.execute('DELETE FROM viewed_groups')
       connection.execute('DELETE FROM recommendation_pool')
       connection.execute('DELETE FROM manual_uploads')
       connection.commit()
+    for export_file in settings.viewed_qrcode_dir.iterdir():
+      if export_file.is_file():
+        export_file.unlink()
+    if settings.viewed_links_csv_path.exists():
+      settings.viewed_links_csv_path.unlink()
     self.service = SearchService(settings)
+
+  def tearDown(self):
+    self.service._page_client.close()
+
+  def _read_viewed_links_csv(self) -> list[dict[str, str]]:
+    csv_path = self.service.settings.viewed_links_csv_path
+    with csv_path.open('r', encoding='utf-8-sig', newline='') as csv_file:
+      return list(csv.DictReader(csv_file))
 
   def _make_card(self, index: int) -> ProductCard:
     return ProductCard(
@@ -218,6 +257,30 @@ class SearchServiceTests(unittest.TestCase):
       if target_path.exists():
         target_path.unlink()
 
+  def test_normalize_qrcode_path_renames_wecom_filename_to_wechat(self):
+    legacy_filename = 'DeepSeek-V2_企业微信_abcd1234.png'
+    legacy_path = self.service.settings.qrcode_dir / legacy_filename
+    legacy_path.write_bytes(b'legacy-wecom')
+    target_path = None
+    try:
+      normalized = self.service._normalize_legacy_qrcode_path(
+        f'/assets/qrcodes/{legacy_filename}',
+        app_name='DeepSeek-V2',
+        platform=Platform.WECOM,
+      )
+      self.assertEqual(
+        normalized,
+        f'/assets/qrcodes/DeepSeek-V2_{self.service._safe_qrcode_name(Platform.WECHAT.value, fallback="platform")}_abcd1234.png',
+      )
+      target_path = self.service.settings.qrcode_dir / normalized.rsplit('/', 1)[-1]
+      self.assertTrue(target_path.exists())
+      self.assertFalse(legacy_path.exists())
+    finally:
+      if legacy_path.exists():
+        legacy_path.unlink()
+      if target_path is not None and target_path.exists():
+        target_path.unlink()
+
   def test_load_cached_search_normalizes_legacy_qrcode_and_rewrites_cache(self):
     legacy_stem = hashlib.sha1(f'cache-legacy-{time.time_ns()}'.encode('utf-8')).hexdigest()
     legacy_filename = f'{legacy_stem}.png'
@@ -336,6 +399,52 @@ class SearchServiceTests(unittest.TestCase):
         legacy_path.unlink()
       if target_path is not None and target_path.exists():
         target_path.unlink()
+
+  def test_list_viewed_groups_canonicalizes_legacy_wecom_platform_and_rewrites_db(self):
+    now = datetime.now(timezone.utc).isoformat()
+    with get_connection(self.service.settings.database_path) as connection:
+      connection.execute(
+        '''
+        INSERT INTO viewed_groups (
+          view_key,
+          product_id,
+          app_name,
+          platform,
+          group_type,
+          entry_type,
+          entry_url,
+          image_path,
+          fallback_url,
+          viewed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+        (
+          'legacy-wecom-view',
+          'product-legacy',
+          'Legacy Tool',
+          Platform.WECOM.value,
+          GroupType.UNKNOWN.value,
+          'link',
+          'https://work.weixin.qq.com/gm/legacy',
+          None,
+          'https://work.weixin.qq.com/gm/legacy',
+          now,
+        ),
+      )
+      connection.commit()
+
+    groups = self.service.list_viewed_groups()
+
+    self.assertEqual(len(groups), 1)
+    self.assertEqual(groups[0].platform, Platform.WECHAT)
+    with get_connection(self.service.settings.database_path) as connection:
+      row = connection.execute(
+        'SELECT platform FROM viewed_groups WHERE view_key = ?',
+        ('legacy-wecom-view',),
+      ).fetchone()
+    self.assertIsNotNone(row)
+    assert row is not None
+    self.assertEqual(row['platform'], Platform.WECHAT.value)
 
   def test_github_search_filters_noisy_repos(self):
     noisy = GitHubRepositoryCandidate(
@@ -538,6 +647,36 @@ class SearchServiceTests(unittest.TestCase):
 
     links = self.service._collect_relevant_links(page, candidate)
     self.assertIn('https://repo.example.com/community/qrcode', links)
+
+  def test_collect_relevant_links_reuses_cached_soup(self):
+    html = (
+      '<html><body>'
+      '<a href="/example/repo/discussions">Community</a>'
+      '</body></html>'
+    )
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/repo',
+      full_name='example/repo',
+      repo_name='repo',
+      owner_name='example',
+      owner_type='Organization',
+      homepage=None,
+      description='repo',
+      stars=20,
+    )
+    page = FetchedPage(
+      requested_url='https://github.com/example/repo',
+      final_url='https://github.com/example/repo',
+      html=html,
+      title='repo',
+      text='',
+      soup=BeautifulSoup(html, 'html.parser'),
+    )
+
+    with patch('app.search.service.BeautifulSoup', side_effect=AssertionError('should reuse cached soup')):
+      links = self.service._collect_relevant_links(page, candidate)
+
+    self.assertEqual(links, ['https://github.com/example/repo/discussions'])
 
   def test_collect_cards_reuses_page_fetch_cache_for_duplicate_urls(self):
     first_candidate = GitHubRepositoryCandidate(
@@ -905,6 +1044,58 @@ class SearchServiceTests(unittest.TestCase):
     self.assertIsInstance(card.groups[0].entry, QQNumberEntry)
     self.assertEqual(card.groups[0].entry.qq_number, '549762872')
 
+  def test_group_signature_merges_wecom_and_wechat_links(self):
+    wecom_group = ExtractedGroupCandidate(
+      platform=Platform.WECOM,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://example.com/community',
+      context='work wechat',
+      entry_url='https://work.weixin.qq.com/gm/shared-room?utm_source=test',
+      fallback_url='https://work.weixin.qq.com/gm/shared-room?utm_source=test',
+      source_urls=['https://example.com/community'],
+    )
+    wechat_group = ExtractedGroupCandidate(
+      platform=Platform.WECHAT,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://example.com/community',
+      context='wechat',
+      entry_url='https://work.weixin.qq.com/gm/shared-room',
+      fallback_url='https://work.weixin.qq.com/gm/shared-room',
+      source_urls=['https://example.com/community'],
+    )
+
+    self.assertEqual(
+      self.service._group_signature(wecom_group),
+      self.service._group_signature(wechat_group),
+    )
+
+  def test_build_product_card_canonicalizes_wecom_platform_to_wechat(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/wecom-tool',
+      full_name='example/wecom-tool',
+      repo_name='wecom-tool',
+      owner_name='example',
+      owner_type='Organization',
+      homepage='https://repo.example.com',
+      description='repo',
+      stars=10,
+    )
+    group = ExtractedGroupCandidate(
+      platform=Platform.WECOM,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://repo.example.com/community',
+      context='community',
+      entry_url='https://work.weixin.qq.com/gm/canonical',
+      fallback_url='https://work.weixin.qq.com/gm/canonical',
+      qrcode_verified=False,
+      source_urls=['https://repo.example.com/community'],
+    )
+
+    card = self.service._build_product_card(candidate, [group])
+
+    self.assertEqual(len(card.groups), 1)
+    self.assertEqual(card.groups[0].platform, Platform.WECHAT)
+
   def test_github_search_prioritizes_exact_repo_name_over_stars(self):
     exact = GitHubRepositoryCandidate(
       repo_url='https://github.com/labring/FastGPT',
@@ -1209,6 +1400,67 @@ class SearchServiceTests(unittest.TestCase):
     filtered = self.service._filter_viewed_cards([card])
     self.assertEqual(filtered, [])
 
+  def test_legacy_wecom_viewed_group_still_filters_canonical_wechat_result(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/wecom-filter',
+      full_name='example/wecom-filter',
+      repo_name='wecom-filter',
+      owner_name='example',
+      owner_type='Organization',
+      homepage='https://repo.example.com',
+      description='repo',
+      stars=10,
+    )
+    group = ExtractedGroupCandidate(
+      platform=Platform.WECOM,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://repo.example.com/community',
+      context='community',
+      entry_url='https://work.weixin.qq.com/gm/legacy-filter',
+      fallback_url='https://work.weixin.qq.com/gm/legacy-filter',
+      qrcode_verified=False,
+      source_urls=['https://repo.example.com/community'],
+    )
+
+    legacy_group_id = hashlib.sha1(
+      f'{candidate.full_name.lower()}:{Platform.WECOM.value}:link:https://work.weixin.qq.com/gm/legacy-filter'.encode('utf-8'),
+    ).hexdigest()[:16]
+    now = datetime.now(timezone.utc).isoformat()
+    with get_connection(self.service.settings.database_path) as connection:
+      connection.execute(
+        '''
+        INSERT INTO viewed_groups (
+          view_key,
+          product_id,
+          app_name,
+          platform,
+          group_type,
+          entry_type,
+          entry_url,
+          image_path,
+          fallback_url,
+          viewed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+        (
+          legacy_group_id,
+          self.service._candidate_product_id(candidate),
+          candidate.repo_name,
+          Platform.WECOM.value,
+          GroupType.UNKNOWN.value,
+          'link',
+          'https://work.weixin.qq.com/gm/legacy-filter',
+          None,
+          'https://work.weixin.qq.com/gm/legacy-filter',
+          now,
+        ),
+      )
+      connection.commit()
+
+    card = self.service._build_product_card(candidate, [group])
+    filtered = self.service._filter_viewed_cards([card])
+    self.assertEqual(filtered, [])
+
   def test_verify_reveals_changed_qrcode_group(self):
     candidate = GitHubRepositoryCandidate(
       repo_url='https://github.com/example/repo',
@@ -1282,6 +1534,266 @@ class SearchServiceTests(unittest.TestCase):
     self.assertEqual(len(filtered), 1)
     self.assertEqual(len(filtered[0].groups), 1)
 
+  def test_mark_group_viewed_exports_qrcode_file(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/qr-tool',
+      full_name='example/qr-tool',
+      repo_name='qr-tool',
+      owner_name='example',
+      owner_type='Organization',
+      homepage='https://repo.example.com',
+      description='repo',
+      stars=10,
+    )
+    group = ExtractedGroupCandidate(
+      platform=Platform.WECOM,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://repo.example.com/community',
+      context='community',
+      image_url='https://repo.example.com/qr.png',
+      image_bytes=make_image_bytes(420, 420),
+      image_content_type='image/png',
+      entry_url='https://work.weixin.qq.com/gm/abc',
+      fallback_url='https://work.weixin.qq.com/gm/abc',
+      qrcode_verified=True,
+      source_urls=['https://repo.example.com/community'],
+    )
+
+    card = self.service._build_product_card(candidate, [group])
+    viewed_group = card.groups[0]
+    source_filename = viewed_group.entry.image_path.rsplit('/', 1)[-1]
+    source_path = self.service.settings.qrcode_dir / source_filename
+    export_filename = self.service._build_viewed_qrcode_export_filename(
+      app_name=card.app_name,
+      platform=viewed_group.platform,
+      view_key=viewed_group.group_id,
+      source_filename=source_filename,
+    )
+    export_path = self.service.settings.viewed_qrcode_dir / export_filename
+
+    try:
+      self.service.mark_group_viewed(card.product_id, card.app_name, viewed_group)
+      self.assertTrue(export_path.exists())
+      self.assertEqual(export_path.read_bytes(), source_path.read_bytes())
+    finally:
+      if source_path.exists():
+        source_path.unlink()
+      if export_path.exists():
+        export_path.unlink()
+
+  def test_remove_viewed_group_deletes_exported_qrcode_file(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/qr-tool',
+      full_name='example/qr-tool',
+      repo_name='qr-tool',
+      owner_name='example',
+      owner_type='Organization',
+      homepage='https://repo.example.com',
+      description='repo',
+      stars=10,
+    )
+    group = ExtractedGroupCandidate(
+      platform=Platform.WECOM,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://repo.example.com/community',
+      context='community',
+      image_url='https://repo.example.com/qr.png',
+      image_bytes=make_image_bytes(430, 430),
+      image_content_type='image/png',
+      entry_url='https://work.weixin.qq.com/gm/remove',
+      fallback_url='https://work.weixin.qq.com/gm/remove',
+      qrcode_verified=True,
+      source_urls=['https://repo.example.com/community'],
+    )
+
+    card = self.service._build_product_card(candidate, [group])
+    viewed_group = card.groups[0]
+    source_filename = viewed_group.entry.image_path.rsplit('/', 1)[-1]
+    source_path = self.service.settings.qrcode_dir / source_filename
+    export_filename = self.service._build_viewed_qrcode_export_filename(
+      app_name=card.app_name,
+      platform=viewed_group.platform,
+      view_key=viewed_group.group_id,
+      source_filename=source_filename,
+    )
+    export_path = self.service.settings.viewed_qrcode_dir / export_filename
+
+    try:
+      self.service.mark_group_viewed(card.product_id, card.app_name, viewed_group)
+      self.assertTrue(export_path.exists())
+      self.service.remove_viewed_group(viewed_group.group_id)
+      self.assertFalse(export_path.exists())
+    finally:
+      if source_path.exists():
+        source_path.unlink()
+      if export_path.exists():
+        export_path.unlink()
+
+  def test_mark_group_viewed_exports_qq_number_to_csv(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/qq-tool',
+      full_name='example/qq-tool',
+      repo_name='qq-tool',
+      owner_name='example',
+      owner_type='Organization',
+      homepage='https://repo.example.com',
+      description='repo',
+      stars=10,
+    )
+    group = ExtractedGroupCandidate(
+      platform=Platform.QQ,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://repo.example.com/community',
+      context='community',
+      qq_number='123456789',
+      qrcode_verified=False,
+      source_urls=['https://repo.example.com/community'],
+    )
+
+    card = self.service._build_product_card(candidate, [group])
+    self.service.mark_group_viewed(card.product_id, card.app_name, card.groups[0])
+
+    rows = self._read_viewed_links_csv()
+    self.assertEqual(len(rows), 1)
+    self.assertEqual(rows[0]['entry_type'], 'qq_number')
+    self.assertEqual(rows[0]['entry_value'], '123456789')
+
+  def test_remove_viewed_group_deletes_csv_entry(self):
+    view_key = self.service.manual_upload_group(
+      app_name='Manual Tool',
+      description='manual entry',
+      created_at='2026-04-07',
+      github_stars=321,
+      platform=Platform.DISCORD,
+      group_type=GroupType.UNKNOWN,
+      entry_type='link',
+      entry_url='https://discord.gg/manual-tool',
+      fallback_url='https://discord.gg/manual-tool',
+      qrcode_bytes=None,
+      qrcode_content_type=None,
+    )
+
+    self.assertEqual(len(self._read_viewed_links_csv()), 1)
+    self.service.remove_viewed_group(view_key)
+    self.assertEqual(self._read_viewed_links_csv(), [])
+
+  def test_same_app_multiple_qrcode_exports_do_not_conflict(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/multi-qr-tool',
+      full_name='example/multi-qr-tool',
+      repo_name='multi-qr-tool',
+      owner_name='example',
+      owner_type='Organization',
+      homepage='https://repo.example.com',
+      description='repo',
+      stars=10,
+    )
+    first_group = ExtractedGroupCandidate(
+      platform=Platform.WECOM,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://repo.example.com/community',
+      context='community',
+      image_url='https://repo.example.com/qr-1.png',
+      image_bytes=make_image_bytes(440, 440),
+      image_content_type='image/png',
+      entry_url='https://work.weixin.qq.com/gm/1',
+      fallback_url='https://work.weixin.qq.com/gm/1',
+      qrcode_verified=True,
+      source_urls=['https://repo.example.com/community'],
+    )
+    second_group = ExtractedGroupCandidate(
+      platform=Platform.WECOM,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://repo.example.com/community',
+      context='community',
+      image_url='https://repo.example.com/qr-2.png',
+      image_bytes=make_image_bytes(460, 460),
+      image_content_type='image/png',
+      entry_url='https://work.weixin.qq.com/gm/2',
+      fallback_url='https://work.weixin.qq.com/gm/2',
+      qrcode_verified=True,
+      source_urls=['https://repo.example.com/community'],
+    )
+
+    first_card = self.service._build_product_card(candidate, [first_group])
+    second_card = self.service._build_product_card(candidate, [second_group])
+    first_source = self.service.settings.qrcode_dir / first_card.groups[0].entry.image_path.rsplit('/', 1)[-1]
+    second_source = self.service.settings.qrcode_dir / second_card.groups[0].entry.image_path.rsplit('/', 1)[-1]
+
+    try:
+      self.service.mark_group_viewed(first_card.product_id, first_card.app_name, first_card.groups[0])
+      self.service.mark_group_viewed(second_card.product_id, second_card.app_name, second_card.groups[0])
+
+      exports = sorted(
+        export_file.name for export_file in self.service.settings.viewed_qrcode_dir.iterdir() if export_file.is_file()
+      )
+      self.assertEqual(len(exports), 2)
+      self.assertNotEqual(exports[0], exports[1])
+    finally:
+      if first_source.exists():
+        first_source.unlink()
+      if second_source.exists():
+        second_source.unlink()
+      for export_file in self.service.settings.viewed_qrcode_dir.iterdir():
+        if export_file.is_file():
+          export_file.unlink()
+
+  def test_sync_viewed_exports_skips_missing_qrcode_source(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/missing-qr-tool',
+      full_name='example/missing-qr-tool',
+      repo_name='missing-qr-tool',
+      owner_name='example',
+      owner_type='Organization',
+      homepage='https://repo.example.com',
+      description='repo',
+      stars=10,
+    )
+    group = ExtractedGroupCandidate(
+      platform=Platform.WECOM,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://repo.example.com/community',
+      context='community',
+      image_url='https://repo.example.com/qr-missing.png',
+      image_bytes=make_image_bytes(450, 450),
+      image_content_type='image/png',
+      entry_url='https://work.weixin.qq.com/gm/missing',
+      fallback_url='https://work.weixin.qq.com/gm/missing',
+      qrcode_verified=True,
+      source_urls=['https://repo.example.com/community'],
+    )
+
+    card = self.service._build_product_card(candidate, [group])
+    viewed_group = card.groups[0]
+    source_filename = viewed_group.entry.image_path.rsplit('/', 1)[-1]
+    source_path = self.service.settings.qrcode_dir / source_filename
+    export_filename = self.service._build_viewed_qrcode_export_filename(
+      app_name=card.app_name,
+      platform=viewed_group.platform,
+      view_key=viewed_group.group_id,
+      source_filename=source_filename,
+    )
+    export_path = self.service.settings.viewed_qrcode_dir / export_filename
+
+    try:
+      self.service.mark_group_viewed(card.product_id, card.app_name, viewed_group)
+      self.assertTrue(export_path.exists())
+      source_path.unlink()
+
+      with patch('app.search.service.logger.warning') as warning_mock:
+        self.service._sync_viewed_exports()
+
+      self.assertTrue(export_path.exists())
+      warning_mock.assert_any_call(
+        'Skipping viewed qrcode export because source file is missing: %s',
+        str(source_path),
+      )
+    finally:
+      if source_path.exists():
+        source_path.unlink()
+      if export_path.exists():
+        export_path.unlink()
+
   def test_github_search_adds_cjk_variants_for_chinese_query(self):
     seen_queries: list[str] = []
 
@@ -1314,7 +1826,14 @@ class SearchServiceTests(unittest.TestCase):
 
     viewed = self.service.list_viewed_groups()
     self.assertTrue(any(item.view_key == view_key for item in viewed))
-    self.assertTrue(any(item.platform == Platform.WECOM for item in viewed))
+    self.assertTrue(any(item.platform == Platform.WECHAT for item in viewed))
+    rows = self._read_viewed_links_csv()
+    self.assertEqual(len(rows), 1)
+    self.assertEqual(rows[0]['view_key'], view_key)
+    self.assertEqual(rows[0]['platform'], Platform.WECHAT.value)
+    self.assertEqual(rows[0]['entry_type'], 'link')
+    self.assertEqual(rows[0]['entry_value'], 'https://work.weixin.qq.com/gm/abc')
+    self.assertEqual(rows[0]['fallback_url'], 'https://work.weixin.qq.com/gm/abc')
 
 
 class EntryExtractorTests(unittest.TestCase):
@@ -1380,6 +1899,148 @@ class EntryExtractorTests(unittest.TestCase):
     self.assertEqual(
       candidate.image_url,
       'https://raw.githubusercontent.com/deepseek-ai/DeepSeek-V2/refs/heads/main/figures/qr.jpeg',
+    )
+
+  def test_extract_reuses_cached_page_soup(self):
+    html = '''
+      <html><body>
+        <a href="https://work.weixin.qq.com/gm/abc">Join work wechat group</a>
+      </body></html>
+    '''
+    page = FetchedPage(
+      requested_url='https://example.com/community',
+      final_url='https://example.com/community',
+      html=html,
+      title='Community',
+      text='',
+      soup=BeautifulSoup(html, 'html.parser'),
+    )
+
+    with patch('app.search.entry_extractor.BeautifulSoup', side_effect=AssertionError('should reuse cached soup')):
+      candidates = self.extractor.extract([page])
+
+    self.assertEqual(len(candidates), 1)
+    self.assertEqual(candidates[0].platform, Platform.WECOM)
+
+  def test_extract_non_github_page_scans_footer_qrcode(self):
+    page = FetchedPage(
+      requested_url='https://example.com',
+      final_url='https://example.com',
+      html='''
+        <html><body>
+          <article>
+            <img src="https://cdn.example.com/hero.png" alt="hero banner" />
+          </article>
+          <footer>
+            <img src="https://cdn.example.com/footer-wechat-qrcode.png" alt="wechat discussion group qrcode" />
+          </footer>
+        </body></html>
+      ''',
+      title='Example',
+      text='',
+    )
+    qr_points = np.array([[[80.0, 80.0], [220.0, 80.0], [220.0, 220.0], [80.0, 220.0]]], dtype=np.float32)
+
+    with patch.object(
+      self.extractor,
+      '_download_image',
+      return_value=(self.square_image, 'image/png'),
+    ), patch.object(
+      self.extractor,
+      '_analyze_qrcode',
+      return_value=(None, qr_points),
+    ):
+      candidates = self.extractor.extract([page])
+
+    self.assertEqual(len(candidates), 1)
+    self.assertEqual(candidates[0].platform, Platform.WECHAT)
+    self.assertTrue(candidates[0].image_url.endswith('footer-wechat-qrcode.png'))
+    self.assertEqual(candidates[0].source_url, 'https://example.com')
+
+  def test_extract_github_page_keeps_readme_scoping(self):
+    page = FetchedPage(
+      requested_url='https://github.com/example/repo',
+      final_url='https://github.com/example/repo',
+      html='''
+        <html><body>
+          <article class="markdown-body">
+            <a href="https://discord.com/invite/readme-main">Discord community</a>
+          </article>
+          <footer>
+            <a href="https://discord.com/invite/footer-noise">Discord footer community</a>
+          </footer>
+        </body></html>
+      ''',
+      title='Repo',
+      text='',
+    )
+
+    candidates = self.extractor.extract([page])
+
+    self.assertEqual(len(candidates), 1)
+    self.assertEqual(candidates[0].platform, Platform.DISCORD)
+    self.assertEqual(candidates[0].entry_url, 'https://discord.com/invite/readme-main')
+
+  def test_extract_visual_candidates_reuse_download_for_same_image_url(self):
+    page = FetchedPage(
+      requested_url='https://example.com',
+      final_url='https://example.com',
+      html='''
+        <html><body>
+          <img src="https://cdn.example.com/shared-qr.png" alt="Wechat community qrcode" />
+          <a href="https://cdn.example.com/shared-qr.png">Discord community QR</a>
+        </body></html>
+      ''',
+      title='Example',
+      text='',
+    )
+    qr_points = np.array([[[80.0, 80.0], [220.0, 80.0], [220.0, 220.0], [80.0, 220.0]]], dtype=np.float32)
+
+    with patch.object(
+      self.extractor,
+      '_download_image',
+      return_value=(self.square_image, 'image/png'),
+    ) as download_mock, patch.object(
+      self.extractor,
+      '_analyze_qrcode',
+      return_value=(None, qr_points),
+    ):
+      candidates = self.extractor.extract([page])
+
+    self.assertEqual(download_mock.call_count, 1)
+    self.assertEqual(len(candidates), 2)
+    self.assertEqual([candidate.platform for candidate in candidates], [Platform.WECHAT, Platform.DISCORD])
+
+  def test_extract_visual_candidates_preserve_original_task_order(self):
+    page = FetchedPage(
+      requested_url='https://example.com',
+      final_url='https://example.com',
+      html='''
+        <html><body>
+          <img src="https://cdn.example.com/wechat.png" alt="Wechat community qrcode" />
+          <img src="https://cdn.example.com/discord.png" alt="Discord community qrcode" />
+        </body></html>
+      ''',
+      title='Example',
+      text='',
+    )
+    qr_points = np.array([[[80.0, 80.0], [220.0, 80.0], [220.0, 220.0], [80.0, 220.0]]], dtype=np.float32)
+
+    def fake_download(image_url: str):
+      if image_url.endswith('wechat.png'):
+        time.sleep(0.05)
+      return self.square_image, 'image/png'
+
+    with patch.object(self.extractor, '_download_image', side_effect=fake_download), patch.object(
+      self.extractor,
+      '_analyze_qrcode',
+      return_value=(None, qr_points),
+    ):
+      candidates = self.extractor.extract([page])
+
+    self.assertEqual(
+      [candidate.image_url for candidate in candidates],
+      ['https://cdn.example.com/wechat.png', 'https://cdn.example.com/discord.png'],
     )
 
   def test_filters_chat_screenshot_before_download(self):
@@ -1480,6 +2141,46 @@ class EntryExtractorTests(unittest.TestCase):
     self.assertIn('official account', nearby.lower())
     self.assertNotIn('discussion group', nearby.lower())
 
+  def test_collect_nearby_text_uses_adjacent_text_for_multi_image_parent(self):
+    soup = BeautifulSoup(
+      '''
+      <div>
+        <img src="https://cdn.example.com/image-a.png" />
+        <span>wechat official account qrcode</span>
+        <img src="https://cdn.example.com/image-b.png" />
+        <span>wechat discussion group qrcode</span>
+      </div>
+      ''',
+      'html.parser',
+    )
+    images = soup.find_all('img')
+    first_nearby = self.extractor._collect_nearby_text(images[0]).lower()
+    second_nearby = self.extractor._collect_nearby_text(images[1]).lower()
+
+    self.assertIn('official account', first_nearby)
+    self.assertNotIn('discussion group', first_nearby)
+    self.assertIn('discussion group', second_nearby)
+    self.assertNotIn('official account', second_nearby)
+
+  def test_rejects_official_account_visual_candidate_without_group_intent(self):
+    qr_points = np.array([[[80.0, 80.0], [220.0, 80.0], [220.0, 220.0], [80.0, 220.0]]], dtype=np.float32)
+
+    with patch.object(self.extractor, '_analyze_qrcode', return_value=(None, qr_points)), patch.object(
+      self.extractor,
+      '_crop_qrcode',
+      return_value=self.small_square_image,
+    ):
+      candidate = self.extractor._extract_visual_candidate(
+        image_url='https://cdn.example.com/image-a.png',
+        page_url='https://example.com',
+        full_context='wechat official account qrcode',
+        image_bytes=self.square_image,
+        content_type='image/png',
+        entry_url=None,
+      )
+
+    self.assertIsNone(candidate)
+
   def test_prefers_discussion_group_qrcode_over_account_qrcode(self):
     page = FetchedPage(
       requested_url='https://example.com/community',
@@ -1514,6 +2215,46 @@ class EntryExtractorTests(unittest.TestCase):
 
     self.assertEqual(len(candidates), 1)
     self.assertIn('discussion-group', candidates[0].image_url)
+
+  def test_extract_multi_qrcode_container_prefers_group_and_filters_account(self):
+    page = FetchedPage(
+      requested_url='https://example.com/community',
+      final_url='https://example.com/community',
+      html='''
+        <html><body>
+          <footer>
+            <div>
+              <img src="https://cdn.example.com/image-a.png" />
+              <span>wechat official account qrcode</span>
+              <img src="https://cdn.example.com/image-b.png" />
+              <span>wechat discussion group qrcode</span>
+            </div>
+          </footer>
+        </body></html>
+      ''',
+      title='community',
+      text='',
+    )
+    qr_points = np.array([[[80.0, 80.0], [220.0, 80.0], [220.0, 220.0], [80.0, 220.0]]], dtype=np.float32)
+
+    with patch.object(
+      self.extractor,
+      '_download_image',
+      return_value=(self.square_image, 'image/png'),
+    ), patch.object(
+      self.extractor,
+      '_analyze_qrcode',
+      return_value=(None, qr_points),
+    ), patch.object(
+      self.extractor,
+      '_crop_qrcode',
+      return_value=self.small_square_image,
+    ):
+      candidates = self.extractor.extract([page])
+
+    self.assertEqual(len(candidates), 1)
+    self.assertEqual(candidates[0].platform, Platform.WECHAT)
+    self.assertTrue(candidates[0].image_url.endswith('image-b.png'))
 
   def test_allows_undecoded_qr_with_qr_url_hint(self):
     qr_points = np.array([[[80.0, 80.0], [220.0, 80.0], [220.0, 220.0], [80.0, 220.0]]], dtype=np.float32)
@@ -1901,6 +2642,44 @@ class SearchApiTests(unittest.TestCase):
     self.assertEqual(response.status_code, 200)
     self.assertEqual(len(response.json()['results']), 1)
     self.assertIsNone(response.json()['empty_message'])
+
+  def test_search_response_keeps_all_groups(self):
+    mock_card = ProductCard(
+      product_id='abc123',
+      app_name='TestApp',
+      description='A test app',
+      github_stars=100,
+      created_at=None,
+      verified_at=datetime.now(timezone.utc),
+      groups=[
+        {
+          'group_id': 'group-discord',
+          'platform': Platform.DISCORD,
+          'group_type': GroupType.UNKNOWN,
+          'entry': {'type': 'link', 'url': 'https://discord.com/invite/testapp'},
+          'is_added': False,
+          'source_urls': ['https://example.com/community'],
+        },
+        {
+          'group_id': 'group-qq',
+          'platform': Platform.QQ,
+          'group_type': GroupType.UNKNOWN,
+          'entry': {'type': 'qq_number', 'qq_number': '123456789'},
+          'is_added': False,
+          'source_urls': ['https://example.com/community'],
+        },
+      ],
+      group_discovery_status=GroupDiscoveryStatus.FOUND,
+      official_site_url='https://testapp.dev',
+      github_repo_url='https://github.com/example/testapp',
+    )
+    with patch('app.api.routes.search_service.search', return_value=[mock_card]):
+      response = self.client.post('/api/search', json={'query': 'testapp'})
+
+    self.assertEqual(response.status_code, 200)
+    payload = response.json()
+    self.assertEqual(len(payload['results']), 1)
+    self.assertEqual(len(payload['results'][0]['groups']), 2)
 
   def test_search_refresh_flag_forces_refresh(self):
     with patch('app.api.routes.search_service.search', return_value=[]) as search_mock:

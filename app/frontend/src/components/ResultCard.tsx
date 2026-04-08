@@ -1,3 +1,4 @@
+import { formatGroupLabel } from '../domain/groupDisplay'
 import type { OfficialGroup, ProductCard } from '../domain/types'
 
 function dedupeGroups(groups: OfficialGroup[]) {
@@ -17,7 +18,7 @@ function getPrimaryGroup(groups: OfficialGroup[]) {
 }
 
 function getGroupLabel(group: OfficialGroup) {
-  return `${group.platform} · ${group.groupType}`
+  return formatGroupLabel(group.platform, group.groupType)
 }
 
 type ResultCardProps = {
