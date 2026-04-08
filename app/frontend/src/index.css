@@ -1,17 +1,19 @@
 :root {
-  --page-bg: #f4efe3;
-  --page-bg-alt: #f8f3e8;
+  --page-bg: #f2ede2;
+  --page-bg-alt: #f8f5ed;
   --surface: rgba(255, 255, 255, 0.92);
-  --border: rgba(61, 74, 66, 0.16);
-  --text: #556254;
-  --heading: #1d2a24;
-  --muted: #728170;
-  --accent-soft: #dfeee0;
-  --accent-strong: #2d6a43;
+  --border: rgba(61, 74, 66, 0.14);
+  --text: #4f5e54;
+  --heading: #19231e;
+  --muted: #6d7b72;
+  --accent-soft: #dde9df;
+  --accent-strong: #275d3c;
   --code-bg: rgba(237, 239, 230, 0.92);
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
 
-  --sans: 'Aptos', 'Trebuchet MS', sans-serif;
-  --display: 'Georgia', 'Times New Roman', serif;
+  --sans: 'Segoe UI Variable', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --display: 'Iowan Old Style', 'Source Han Serif SC', 'Noto Serif SC', serif;
   --mono: 'Cascadia Code', Consolas, monospace;
 
   font: 18px/1.6 var(--sans);
@@ -27,7 +29,7 @@
 }
 
 #root {
-  width: min(1180px, 100%);
+  width: min(1240px, 100%);
   margin: 0 auto;
   min-height: 100svh;
   box-sizing: border-box;
@@ -36,6 +38,9 @@
 body {
   margin: 0;
   min-width: 320px;
+  background:
+    radial-gradient(circle at top left, rgba(214, 229, 217, 0.6), transparent 26%),
+    linear-gradient(180deg, var(--page-bg), var(--page-bg-alt));
 }
 
 h1,

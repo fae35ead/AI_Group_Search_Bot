@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { fetchHealth, type HealthPayload } from './api/health'
 import { fetchRecommendations, fetchViewedGroups, manualUploadGroup, markGroupViewed, removeViewedGroup, searchOfficialGroups } from './api/search'
+import { ResultCard } from './components/ResultCard'
 import type { GroupType, ManualEntryType, OfficialGroup, Platform, ProductCard, RecommendedTool, SearchFilters, ViewedGroup } from './domain/types'
 import './App.css'
 
@@ -22,18 +23,6 @@ function formatStars(value: number | null) {
   }
 
   return new Intl.NumberFormat('zh-CN').format(value)
-}
-
-function dedupeGroups(groups: OfficialGroup[]) {
-  const seen = new Set<string>()
-  return groups.filter((group) => {
-    const key = group.groupId
-    if (seen.has(key)) {
-      return false
-    }
-    seen.add(key)
-    return true
-  })
 }
 
 function isAbortError(error: unknown): boolean {
@@ -149,6 +138,7 @@ function App() {
   const [markingGroupIds, setMarkingGroupIds] = useState<string[]>([])
   const [removingViewedKeys, setRemovingViewedKeys] = useState<string[]>([])
   const [expandedViewedApps, setExpandedViewedApps] = useState<string[]>([])
+  const [expandedResultCards, setExpandedResultCards] = useState<string[]>([])
   const [loadingViewed, setLoadingViewed] = useState(false)
   const [manualUploadOpen, setManualUploadOpen] = useState(false)
   const [manualUploading, setManualUploading] = useState(false)
@@ -210,6 +200,8 @@ function App() {
     return grouped
   }, [viewedGroups])
 
+  const hasSearchContext = loading || rawResults.length > 0 || Boolean(emptyMessage) || Boolean(searchError)
+
   useEffect(() => {
     async function loadHealth() {
       try {
@@ -267,6 +259,10 @@ function App() {
   useEffect(() => {
     setExpandedViewedApps((prev) => prev.filter((key) => viewedGroupsByApp.some((item) => item.key === key)))
   }, [viewedGroupsByApp])
+
+  useEffect(() => {
+    setExpandedResultCards((prev) => prev.filter((id) => displayedResults.some((item) => item.productId === id)))
+  }, [displayedResults])
 
   useEffect(() => {
     persistViewedGroupsToStorage(viewedGroups)
@@ -514,6 +510,10 @@ function App() {
     setExpandedViewedApps((prev) => (prev.includes(appKey) ? prev.filter((id) => id !== appKey) : [...prev, appKey]))
   }
 
+  function toggleResultCard(productId: string) {
+    setExpandedResultCards((prev) => (prev.includes(productId) ? prev.filter((id) => id !== productId) : [...prev, productId]))
+  }
+
   async function handleCopyQQNumber(qqNumber: string) {
     try {
       await navigator.clipboard.writeText(qqNumber)
@@ -540,47 +540,47 @@ function App() {
 
   return (
     <div className="shell">
-      <header className="hero">
-        <div>
-          <p className="eyebrow">统一探索搜索</p>
-          <h1>AI 工具发现</h1>
-          <p className="hero-text">
-            输入 AI 工具、产品名、关键词、官网域名或 GitHub 仓库，系统会优先从 GitHub 与官网抓取官方群入口。
-          </p>
+      <header className="brand-bar section-intro" style={{ '--i': 0 } as React.CSSProperties}>
+        <div className="brand-lockup">
+          <p className="eyebrow">AI 群聊发现器</p>
+          <h1 className="visually-hidden">AI 群聊发现器</h1>
         </div>
-        <div className="hero-meta">
+        <div className="brand-status">
           <span className={`status-badge ${health ? 'online' : 'offline'}`}>{health ? '后端已连接' : '后端未连接'}</span>
-          <p>支持微信、QQ、飞书、Discord、企业微信、钉钉群入口识别。</p>
         </div>
       </header>
 
       <main className="workspace">
-        <section className="panel search-panel">
+        <section className="panel search-panel search-panel-compact section-intro" style={{ '--i': 1 } as React.CSSProperties}>
           <form className="search-form" onSubmit={handleSubmit}>
             <label className="search-label" htmlFor="search-query">
               搜索输入
             </label>
-            <div className="search-row">
+            <div className="search-row search-row-compact">
               <input
                 id="search-query"
+                type="search"
+                autoComplete="off"
+                enterKeyHint="search"
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
                 placeholder="例如 ChatGPT、FastGPT、n8n、cursor.com、github.com/labring/FastGPT"
               />
-              <button type="submit">
-                {loading ? '取消并重搜' : '搜索'}
+              <button className="action-button primary" disabled={loading} type="submit">
+                {loading ? '搜索中…' : '搜索'}
               </button>
               <button
                 disabled={rawResults.length === 0}
                 onClick={() => void handleVerify()}
+                className="action-button secondary"
                 type="button"
               >
-                {verifying ? '验证中...' : '验证'}
+                {verifying ? '验证中…' : '重新验证'}
               </button>
             </div>
           </form>
 
-          <div className="filter-row">
+          <div className="filter-row filter-row-compact">
             <label className="filter-label" htmlFor="filter-min-stars">
               最低星级
             </label>
@@ -633,14 +633,20 @@ function App() {
               />
               <span className="filter-value">{resultLimit}</span>
             </div>
-            <button className="manual-upload-toggle" onClick={toggleManualUpload} type="button">
-              {manualUploadOpen ? '收起手动上传' : '手动上传'}
-            </button>
           </div>
 
-          <div className="helper-row">
-            <span>支持：AI 工具名 / 关键词 / 官网域名 / GitHub 仓库</span>
-            <span>结果：可调返回数量（3-50），筛选即时生效</span>
+          <div className="search-utility-row">
+            <button
+              aria-expanded={manualUploadOpen}
+              className="manual-upload-toggle utility-trigger"
+              onClick={toggleManualUpload}
+              type="button"
+            >
+              {manualUploadOpen ? '收起手动上传' : '手动上传'}
+            </button>
+            <p className="search-helper-copy">
+              支持：AI 工具名 / 关键词 / 官网域名 / GitHub 仓库。结果：可调返回数量（3-50），筛选即时生效。
+            </p>
           </div>
 
           {manualUploadOpen ? (
@@ -765,7 +771,7 @@ function App() {
         </section>
 
         {recommendations.length > 0 ? (
-          <section className="recommendation-strip">
+          <section className="recommendation-strip recommendation-strip-compact section-intro" style={{ '--i': 2 } as React.CSSProperties}>
             <span className="recommendation-label">今日推荐</span>
             <button
               className="recommendation-tag"
@@ -792,10 +798,10 @@ function App() {
           </section>
         ) : null}
 
-        <section className="panel viewed-panel">
+        <section className="panel viewed-panel utility-panel section-intro" style={{ '--i': 3 } as React.CSSProperties}>
           <div className="viewed-header">
             <p className="viewed-title">已查看列表</p>
-            <button className="viewed-toggle" onClick={() => setViewedExpanded((prev) => !prev)} type="button">
+            <button aria-expanded={viewedExpanded} className="viewed-toggle" onClick={() => setViewedExpanded((prev) => !prev)} type="button">
               {viewedExpanded ? '收起' : `展开 (${viewedGroups.length})`}
             </button>
           </div>
@@ -811,7 +817,7 @@ function App() {
                     <article className="viewed-app-card" key={appItem.key}>
                       <div className="viewed-app-header">
                         <p className="viewed-app">{appItem.appName}</p>
-                        <button className="viewed-toggle" onClick={() => toggleViewedApp(appItem.key)} type="button">
+                        <button aria-expanded={expanded} className="viewed-toggle" onClick={() => toggleViewedApp(appItem.key)} type="button">
                           {expanded ? `收起 (${appItem.groups.length})` : `展开 (${appItem.groups.length})`}
                         </button>
                       </div>
@@ -875,15 +881,36 @@ function App() {
           ) : null}
         </section>
 
-        <section className="results-section">
+        <section className="results-section section-intro" style={{ '--i': 4 } as React.CSSProperties}>
+          {displayedResults.length > 0 ? (
+            <div className="results-overview" aria-live="polite">
+              <div>
+                <p className="results-eyebrow">搜索结果</p>
+                <h2>{query.trim() ? `“${query.trim()}” 的群聊入口` : '搜索结果'}</h2>
+              </div>
+              <div className="results-meta">
+                <span>{displayedResults.length} 个结果</span>
+                {rawResults.length > 0 && rawResults.length !== displayedResults.length ? (
+                  <span>筛选后保留 {displayedResults.length} / {rawResults.length}</span>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
+
           {loading ? (
             <div className="skeleton-grid" aria-label="搜索加载中">
               {Array.from({ length: 3 }).map((_, index) => (
                 <article className="skeleton-card" key={index}>
-                  <div className="skeleton-line title" />
-                  <div className="skeleton-line" />
-                  <div className="skeleton-line short" />
-                  <div className="skeleton-block" />
+                  <div className="skeleton-main">
+                    <div className="skeleton-line title" />
+                    <div className="skeleton-line" />
+                    <div className="skeleton-line short" />
+                    <div className="skeleton-inline">
+                      <div className="skeleton-pill" />
+                      <div className="skeleton-pill short" />
+                    </div>
+                  </div>
+                  <div className="skeleton-qr" />
                 </article>
               ))}
             </div>
@@ -898,118 +925,21 @@ function App() {
           ) : null}
 
           {!loading && !emptyMessage && displayedResults.length > 0 ? (
-            <div className="results-grid">
-              {displayedResults.map((card) => {
-                const groups = dedupeGroups(card.groups)
-                const primaryGroup = groups.find((group) => group.entry.type === 'qrcode') ?? groups[0]
-
-                return (
-                  <article className="panel result-card" key={card.productId}>
-                    <div className="card-header">
-                      <div>
-                        <div className="card-topline">
-                          <p className="card-title">{card.appName}</p>
-                          <span className={`card-status ${card.groupDiscoveryStatus}`}>
-                            {card.groupDiscoveryStatus === 'found' ? '已发现官方群' : '未发现官方群'}
-                          </span>
-                        </div>
-                        <p className="card-description">{card.description || '-'}</p>
-                      </div>
-                    </div>
-
-                    <dl className="meta-list">
-                      <div>
-                        <dt>GitHub stars</dt>
-                        <dd>{formatStars(card.githubStars)}</dd>
-                      </div>
-                      <div>
-                        <dt>创建时间</dt>
-                        <dd>{formatDate(card.createdAt)}</dd>
-                      </div>
-                      <div>
-                        <dt>最近验证时间</dt>
-                        <dd>{formatDate(card.verifiedAt)}</dd>
-                      </div>
-                    </dl>
-
-                    <div className="source-links">
-                      {card.officialSiteUrl ? (
-                        <a className="source-link" href={card.officialSiteUrl} rel="noreferrer" target="_blank">
-                          官网
-                        </a>
-                      ) : null}
-                      {card.githubRepoUrl ? (
-                        <a className="source-link" href={card.githubRepoUrl} rel="noreferrer" target="_blank">
-                          GitHub
-                        </a>
-                      ) : null}
-                    </div>
-
-                    <div className="groups-list">
-                      {groups.map((group) => (
-                        <section className="group-row" key={group.groupId}>
-                          <div className="group-row-header">
-                            <div className="group-tags">
-                              <span className="tag">{group.platform}</span>
-                              <span className="tag muted">{group.groupType}</span>
-                            </div>
-                            <button
-                              className="source-link viewed-mark"
-                              disabled={markingGroupIds.includes(group.groupId)}
-                              onClick={() => void handleMarkViewed(card, group)}
-                              type="button"
-                            >
-                              {markingGroupIds.includes(group.groupId) ? '处理中...' : '标记已查看'}
-                            </button>
-                          </div>
-
-                          {group.entry.type === 'qrcode' ? (
-                            <div className="group-entry">
-                              <img alt={`${card.appName} ${group.platform} 二维码`} className="qrcode-image" src={group.entry.imagePath} />
-                              <div className="group-actions">
-                                <span>已抓取官方群二维码</span>
-                                {group.entry.fallbackUrl ? (
-                                  <a className="link-button" href={group.entry.fallbackUrl} rel="noreferrer" target="_blank">
-                                    打开官方群入口
-                                  </a>
-                                ) : null}
-                              </div>
-                            </div>
-                          ) : group.entry.type === 'qq_number' ? (
-                            <div className="group-entry link-only">
-                              <span className="status-note">{group.entry.note}</span>
-                              <span className="qq-number">QQ群号：{'qqNumber' in group.entry ? group.entry.qqNumber : ''}</span>
-                              <button
-                                className="link-button"
-                                onClick={() => void handleCopyQQNumber('qqNumber' in group.entry ? group.entry.qqNumber : '')}
-                                type="button"
-                              >
-                                复制群号
-                              </button>
-                            </div>
-                          ) : (
-                            <div className="group-entry link-only">
-                              <span className="status-note">{group.entry.note}</span>
-                              <a className="link-button" href={group.entry.url} rel="noreferrer" target="_blank">
-                                打开官方群入口
-                              </a>
-                            </div>
-                          )}
-                        </section>
-                      ))}
-
-                      {primaryGroup?.entry.type === 'qrcode' && primaryGroup.entry.fallbackUrl ? (
-                        <div className="primary-entry-action">
-                          <span>优先展示已抓取到的二维码结果</span>
-                          <a className="link-button" href={primaryGroup.entry.fallbackUrl} rel="noreferrer" target="_blank">
-                            打开官方群入口
-                          </a>
-                        </div>
-                      ) : null}
-                    </div>
-                  </article>
-                )
-              })}
+            <div className="results-grid search-engine-grid">
+              {displayedResults.map((card, index) => (
+                <ResultCard
+                  card={card}
+                  expanded={expandedResultCards.includes(card.productId)}
+                  formatDate={formatDate}
+                  formatStars={formatStars}
+                  index={index}
+                  key={card.productId}
+                  markingGroupIds={markingGroupIds}
+                  onCopyQQNumber={(qqNumber) => void handleCopyQQNumber(qqNumber)}
+                  onMarkViewed={(currentCard, group) => void handleMarkViewed(currentCard, group)}
+                  onToggleExpanded={toggleResultCard}
+                />
+              ))}
             </div>
           ) : null}
 
@@ -1020,7 +950,7 @@ function App() {
             </section>
           ) : null}
 
-          {!loading && !emptyMessage && !searchError && rawResults.length === 0 ? (
+          {!loading && !hasSearchContext ? (
             <section className="panel guide-state">
               <h2>开始搜索</h2>
               <p>输入宽泛关键词时会返回多个相关 AI 工具；输入官网域名或 GitHub 仓库时会优先返回最相关的官方群结果。</p>
