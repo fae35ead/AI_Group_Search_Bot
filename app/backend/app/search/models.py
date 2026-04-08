@@ -47,7 +47,7 @@ class GitHubRepositoryMetadata:
 
 @dataclass(frozen=True)
 class GitHubRepositoryCandidate:
-  repo_url: str
+  repo_url: str | None
   full_name: str
   repo_name: str
   owner_name: str
@@ -55,6 +55,14 @@ class GitHubRepositoryCandidate:
   homepage: str | None
   description: str | None
   stars: int
+  topics: list[str] = field(default_factory=list)
+  pushed_at: str | None = None
+  updated_at: str | None = None
+  created_at: str | None = None
+  readme_excerpt: str | None = None
+  is_fork: bool = False
+  archived: bool = False
+  disabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -160,5 +168,6 @@ class ExtractedGroupCandidate:
   entry_url: str | None = None
   fallback_url: str | None = None
   decoded_payload: str | None = None
+  qq_number: str | None = None
   qrcode_verified: bool = False
   source_urls: list[str] = field(default_factory=list)

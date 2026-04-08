@@ -30,6 +30,53 @@ SCHEMA_STATEMENTS = (
     raw_html_path TEXT NOT NULL
   )
   ''',
+  '''
+  CREATE TABLE IF NOT EXISTS search_cache (
+    query_key TEXT PRIMARY KEY,
+    response_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )
+  ''',
+  '''
+  CREATE TABLE IF NOT EXISTS viewed_groups (
+    view_key TEXT PRIMARY KEY,
+    product_id TEXT NOT NULL,
+    app_name TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    group_type TEXT NOT NULL,
+    entry_type TEXT NOT NULL,
+    entry_url TEXT,
+    image_path TEXT,
+    fallback_url TEXT,
+    viewed_at TEXT NOT NULL
+  )
+  ''',
+  '''
+  CREATE TABLE IF NOT EXISTS recommendation_pool (
+    full_name TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    stars INTEGER NOT NULL,
+    description TEXT,
+    topics_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )
+  ''',
+  '''
+  CREATE TABLE IF NOT EXISTS manual_uploads (
+    view_key TEXT PRIMARY KEY,
+    app_name TEXT NOT NULL,
+    description TEXT,
+    created_at TEXT,
+    github_stars INTEGER,
+    platform TEXT NOT NULL,
+    group_type TEXT NOT NULL,
+    entry_type TEXT NOT NULL,
+    entry_url TEXT,
+    image_path TEXT,
+    fallback_url TEXT,
+    uploaded_at TEXT NOT NULL
+  )
+  ''',
 )
 
 

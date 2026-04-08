@@ -3,6 +3,11 @@ from functools import lru_cache
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Load .env file from backend root
+_load = load_dotenv(Path(__file__).resolve().parents[2] / '.env')
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -16,7 +21,9 @@ class Settings:
   playwright_install_dir: Path
   request_timeout_seconds: float
   user_agent: str
+  github_token: str | None
   search_debug_enabled: bool
+  enable_opencv_qr_decode: bool
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -38,7 +45,7 @@ def get_settings() -> Settings:
   playwright_install_dir = Path.home() / 'AppData' / 'Local' / 'ms-playwright'
 
   return Settings(
-    app_name='AI群聊发现器 Local API',
+    app_name='AI 群聊发现器 Local API',
     backend_root=backend_root,
     data_dir=data_dir,
     public_dir=public_dir,
@@ -46,11 +53,13 @@ def get_settings() -> Settings:
     database_path=database_path,
     cors_origins=('http://127.0.0.1:5173', 'http://localhost:5173'),
     playwright_install_dir=playwright_install_dir,
-    request_timeout_seconds=20.0,
+    request_timeout_seconds=8.0,
     user_agent=(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
       'AppleWebKit/537.36 (KHTML, like Gecko) '
       'Chrome/124.0.0.0 Safari/537.36'
     ),
     search_debug_enabled=_env_flag('AI_GROUP_SEARCH_DEBUG', False),
+    enable_opencv_qr_decode=_env_flag('AI_GROUP_ENABLE_OPENCV_QR_DECODE', True),
+    github_token=os.getenv('GITHUB_TOKEN'),
   )

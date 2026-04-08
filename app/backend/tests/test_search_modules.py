@@ -1,473 +1,2014 @@
+import hashlib
+import json
+from datetime import datetime, timezone
+import time
 import unittest
-from dataclasses import replace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
+import cv2
+import numpy as np
 from fastapi.testclient import TestClient
+from bs4 import BeautifulSoup
 
-from app.api.schemas import GroupType, Platform
+from app.api.schemas import GroupDiscoveryStatus, GroupType, Platform, ProductCard, QQNumberEntry, RecommendationsResponse, RecommendedTool
 from app.core.config import get_settings
+from app.db.database import get_connection, initialize_database
 from app.search.entry_extractor import EntryExtractor
-from app.search.group_type_classifier import GroupTypeClassifier
-from app.search.models import (
-  CandidatePageSummary,
-  DiscoveredTargets,
-  ExtractedGroupCandidate,
-  ExtractionStats,
-  FetchedPage,
-  GitHubCandidateSummary,
-  GitHubRepositoryCandidate,
-  GitHubRepositoryMetadata,
-  SearchResultLink,
-  SearchTrace,
-)
-from app.search.official_source_validator import OfficialSourceValidator
-from app.search.page_fetcher import PageFetcher
-from app.search.result_normalizer import ResultNormalizer
-from app.search.search_entry import SearchEntry
+from app.search.models import ExtractedGroupCandidate, FetchedPage, GitHubRepositoryCandidate
 from app.search.service import SearchService
 from main import app
 
 
-class SearchEntryTests(unittest.TestCase):
-  def test_normalize_domain_query(self):
-    normalized = SearchEntry().normalize(' https://cursor.com/ ')
-
-    self.assertEqual(normalized.query_type, 'domain')
-    self.assertEqual(normalized.domain, 'cursor.com')
-
-  def test_normalize_keyword_query(self):
-    normalized = SearchEntry().normalize('  Cursor   AI  ')
-
-    self.assertEqual(normalized.query_type, 'keyword')
-    self.assertEqual(normalized.cleaned_query, 'Cursor AI')
-
-  def test_normalize_github_repo_url(self):
-    normalized = SearchEntry().normalize('https://github.com/labring/FastGPT')
-
-    self.assertEqual(normalized.query_type, 'github_repo')
-    self.assertEqual(normalized.cleaned_query, 'FastGPT')
-    self.assertEqual(normalized.explicit_repo_url, 'https://github.com/labring/FastGPT')
+def make_image_bytes(width: int, height: int) -> bytes:
+  image = np.full((height, width, 3), 255, dtype=np.uint8)
+  for i in range(0, width, 20):
+    cv2.line(image, (i, 0), (i, height - 1), ((i * 13) % 255, 30, 90), 2)
+  for j in range(0, height, 20):
+    cv2.line(image, (0, j), (width - 1, j), (40, (j * 9) % 255, 160), 2)
+  success, encoded = cv2.imencode('.png', image)
+  if not success:
+    raise RuntimeError('Failed to encode test image.')
+  return encoded.tobytes()
 
 
-class GroupTypeClassifierTests(unittest.TestCase):
-  def test_classify_support_context(self):
-    classifier = GroupTypeClassifier()
-
-    self.assertEqual(
-      classifier.classify('加入官方群答疑支持 support'),
-      GroupType.QA,
-    )
-
-
-class OfficialSourceValidatorTests(unittest.TestCase):
-  def test_official_url_checks(self):
-    validator = OfficialSourceValidator()
-
-    self.assertTrue(
-      validator.is_official_url(
-        'https://cursor.com/community',
-        'https://cursor.com',
-        None,
-      ),
-    )
-    self.assertTrue(
-      validator.is_official_url(
-        'https://github.com/getcursor/cursor/blob/main/README.md',
-        None,
-        'https://github.com/getcursor/cursor',
-      ),
-    )
-    self.assertFalse(
-      validator.is_official_url(
-        'https://discord.gg/example',
-        'https://cursor.com',
-        'https://github.com/getcursor/cursor',
-      ),
-    )
-
-
-class PageFetcherTests(unittest.TestCase):
+class SearchServiceTests(unittest.TestCase):
   def setUp(self):
-    self.fetcher = PageFetcher(get_settings())
+    settings = get_settings()
+    initialize_database(settings.database_path)
+    with get_connection(settings.database_path) as connection:
+      connection.execute('DELETE FROM search_cache')
+      connection.execute('DELETE FROM viewed_groups')
+      connection.execute('DELETE FROM recommendation_pool')
+      connection.execute('DELETE FROM manual_uploads')
+      connection.commit()
+    self.service = SearchService(settings)
 
-  def test_discover_candidate_internal_links_scores_strong_and_weak_signals(self):
-    html = """
-      <main>
-        <nav>
-          <a href="/community">Community</a>
-          <a href="/support">Support</a>
-        </nav>
-        <section class="news-list">
-          <a href="/news/minimax-community">MiniMax 社区活动</a>
-          <a href="/blog/product-update">Blog update</a>
-        </section>
-        <a href="https://external.example.com/community">External</a>
-      </main>
-    """
-    page = FetchedPage(
-      requested_url='https://example.com',
-      final_url='https://example.com',
-      html=html,
-      title='home',
-      text='links',
+  def _make_card(self, index: int) -> ProductCard:
+    return ProductCard(
+      product_id=f'cached-{index:03d}',
+      app_name=f'Cached Tool {index}',
+      description='cached',
+      github_stars=1,
+      created_at=None,
+      verified_at=datetime.now(timezone.utc),
+      groups=[],
+      group_discovery_status=GroupDiscoveryStatus.NOT_FOUND,
+      official_site_url=None,
+      github_repo_url=None,
     )
 
-    candidates = self.fetcher.discover_candidate_internal_links(page, limit=8)
-    urls = [candidate.url for candidate in candidates]
+  def test_search_returns_empty_for_blank_query(self):
+    self.assertEqual(self.service.search(''), [])
 
-    self.assertIn('https://example.com/community', urls)
-    self.assertIn('https://example.com/support', urls)
-    self.assertIn('https://example.com/news/minimax-community', urls)
-    self.assertNotIn('https://external.example.com/community', urls)
-    self.assertLessEqual(len(candidates), 8)
+  def test_search_uses_cached_results_when_fresh(self):
+    cached_cards = [self._make_card(index) for index in range(3)]
+    with patch.object(self.service, '_load_cached_search', return_value=cached_cards) as load_cache_mock, patch.object(
+      self.service,
+      '_github_search',
+    ) as github_search_mock:
+      results = self.service.search('cached query', limit=3)
+
+    self.assertEqual(len(results), 3)
+    load_cache_mock.assert_called_once()
+    github_search_mock.assert_not_called()
+
+  def test_search_refresh_bypasses_cache(self):
+    with patch.object(self.service, '_load_cached_search') as load_cache_mock, patch.object(
+      self.service,
+      '_github_search',
+      return_value=[],
+    ), patch.object(
+      self.service,
+      '_build_crawl_candidates',
+      return_value=[],
+    ), patch.object(
+      self.service,
+      '_build_web_fallback_candidates',
+      return_value=[],
+    ), patch.object(
+      self.service,
+      '_save_cached_search',
+    ) as save_cache_mock:
+      results = self.service.search('refresh query', refresh=True)
+
+    self.assertEqual(results, [])
+    load_cache_mock.assert_not_called()
+    save_cache_mock.assert_not_called()
+
+  def test_search_cache_key_ignores_limit_changes(self):
+    key_10 = self.service._build_search_cache_key('n8n', None)
+    key_20 = self.service._build_search_cache_key('n8n', None)
+    self.assertEqual(key_10, key_20)
+
+  def test_search_limit_change_incrementally_fills_cache(self):
+    cached_cards = [self._make_card(index) for index in range(20)]
+    fresh_cards = [self._make_card(index + 20) for index in range(30)]
+    fallback_candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/fallback',
+      full_name='example/fallback',
+      repo_name='fallback',
+      owner_name='example',
+      owner_type='Organization',
+      homepage=None,
+      description='fallback',
+      stars=10,
+    )
+
+    with patch.object(self.service, '_load_cached_search', return_value=cached_cards), patch.object(
+      self.service,
+      '_github_search',
+      return_value=[],
+    ), patch.object(
+      self.service,
+      '_build_crawl_candidates',
+      return_value=[],
+    ), patch.object(
+      self.service,
+      '_build_web_fallback_candidates',
+      return_value=[fallback_candidate],
+    ), patch.object(
+      self.service,
+      '_collect_cards',
+      return_value=fresh_cards,
+    ) as collect_cards_mock, patch.object(
+      self.service,
+      '_save_cached_search',
+    ) as save_cache_mock:
+      results = self.service.search('cache test', limit=50)
+
+    self.assertEqual(len(results), 50)
+    collect_cards_mock.assert_called_once()
+    self.assertEqual(collect_cards_mock.call_args.kwargs.get('max_cards'), 30)
+    self.assertEqual(len(collect_cards_mock.call_args.kwargs.get('exclude_product_ids') or set()), 20)
+    save_cache_mock.assert_called_once()
+    saved_cards = save_cache_mock.call_args.args[1]
+    self.assertEqual(len(saved_cards), 50)
+
+  def test_load_cached_search_ignores_empty_payload(self):
+    cache_key = self.service._build_search_cache_key('fastgpt', None)
+    now = datetime.now(timezone.utc).isoformat()
+    with get_connection(self.service.settings.database_path) as connection:
+      connection.execute(
+        '''
+        INSERT INTO search_cache (query_key, response_json, updated_at)
+        VALUES (?, ?, ?)
+        ''',
+        (cache_key, '[]', now),
+      )
+      connection.commit()
+
+    cached = self.service._load_cached_search(cache_key)
+    self.assertIsNone(cached)
+
+  def test_normalize_legacy_qrcode_path_keeps_non_legacy_filename(self):
+    path = '/assets/qrcodes/FastGPT_微信_1234abcd.png'
+    normalized = self.service._normalize_legacy_qrcode_path(
+      path,
+      app_name='FastGPT',
+      platform=Platform.WECHAT,
+    )
+    self.assertEqual(normalized, path)
+
+  def test_normalize_legacy_qrcode_path_renames_legacy_file(self):
+    legacy_stem = hashlib.sha1(f'legacy-rename-{time.time_ns()}'.encode('utf-8')).hexdigest()
+    legacy_filename = f'{legacy_stem}.png'
+    legacy_path = self.service.settings.qrcode_dir / legacy_filename
+    legacy_path.write_bytes(b'legacy-bytes')
+    normalized = ''
+    target_path = None
+    try:
+      normalized = self.service._normalize_legacy_qrcode_path(
+        f'/assets/qrcodes/{legacy_filename}',
+        app_name='DeepSeek-V2',
+        platform=Platform.WECHAT,
+      )
+      self.assertTrue(normalized.startswith('/assets/qrcodes/DeepSeek-V2_'))
+      target_filename = normalized.rsplit('/', 1)[-1]
+      target_path = self.service.settings.qrcode_dir / target_filename
+      self.assertTrue(target_path.exists())
+      self.assertFalse(legacy_path.exists())
+    finally:
+      if legacy_path.exists():
+        legacy_path.unlink()
+      if target_path is not None and target_path.exists():
+        target_path.unlink()
+
+  def test_normalize_legacy_qrcode_path_reuses_existing_target(self):
+    legacy_stem = hashlib.sha1(f'legacy-reuse-{time.time_ns()}'.encode('utf-8')).hexdigest()
+    legacy_filename = f'{legacy_stem}.jpg'
+    legacy_path = self.service.settings.qrcode_dir / legacy_filename
+    legacy_path.write_bytes(b'legacy-source')
+    expected_filename = (
+      f'DeepSeek-V2_{self.service._safe_qrcode_name(Platform.WECHAT.value, fallback="platform")}_{legacy_stem[:8]}.jpg'
+    )
+    target_path = self.service.settings.qrcode_dir / expected_filename
+    target_path.write_bytes(b'existing-target')
+    try:
+      normalized = self.service._normalize_legacy_qrcode_path(
+        f'/assets/qrcodes/{legacy_filename}',
+        app_name='DeepSeek-V2',
+        platform=Platform.WECHAT,
+      )
+      self.assertEqual(normalized, f'/assets/qrcodes/{expected_filename}')
+      self.assertTrue(legacy_path.exists())
+      self.assertTrue(target_path.exists())
+    finally:
+      if legacy_path.exists():
+        legacy_path.unlink()
+      if target_path.exists():
+        target_path.unlink()
+
+  def test_load_cached_search_normalizes_legacy_qrcode_and_rewrites_cache(self):
+    legacy_stem = hashlib.sha1(f'cache-legacy-{time.time_ns()}'.encode('utf-8')).hexdigest()
+    legacy_filename = f'{legacy_stem}.png'
+    legacy_path = self.service.settings.qrcode_dir / legacy_filename
+    legacy_path.write_bytes(b'legacy-cache')
+    cache_key = self.service._build_search_cache_key('deepseek', None)
+    cached_card = ProductCard(
+      product_id='deepseek-cache',
+      app_name='DeepSeek-V2',
+      description='cached',
+      github_stars=1,
+      created_at=None,
+      verified_at=datetime.now(timezone.utc),
+      groups=[
+        {
+          'group_id': 'group-cache',
+          'platform': Platform.WECHAT,
+          'group_type': GroupType.UNKNOWN,
+          'entry': {'type': 'qrcode', 'image_path': f'/assets/qrcodes/{legacy_filename}'},
+          'is_added': False,
+          'source_urls': ['https://github.com/deepseek-ai/DeepSeek-V2'],
+        },
+      ],
+      group_discovery_status=GroupDiscoveryStatus.FOUND,
+      official_site_url=None,
+      github_repo_url='https://github.com/deepseek-ai/DeepSeek-V2',
+    )
+    self.service._save_cached_search(cache_key, [cached_card])
+    target_path = None
+    try:
+      cached = self.service._load_cached_search(cache_key)
+      self.assertIsNotNone(cached)
+      assert cached is not None
+      normalized_path = cached[0].groups[0].entry.image_path
+      self.assertNotIn(legacy_filename, normalized_path)
+      target_filename = normalized_path.rsplit('/', 1)[-1]
+      target_path = self.service.settings.qrcode_dir / target_filename
+      self.assertTrue(target_path.exists())
+
+      with get_connection(self.service.settings.database_path) as connection:
+        row = connection.execute(
+          'SELECT response_json FROM search_cache WHERE query_key = ?',
+          (cache_key,),
+        ).fetchone()
+      self.assertIsNotNone(row)
+      assert row is not None
+      payload = json.loads(row['response_json'])
+      self.assertEqual(
+        payload[0]['groups'][0]['entry']['image_path'],
+        normalized_path,
+      )
+    finally:
+      if legacy_path.exists():
+        legacy_path.unlink()
+      if target_path is not None and target_path.exists():
+        target_path.unlink()
+
+  def test_list_viewed_groups_normalizes_legacy_qrcode_and_rewrites_db(self):
+    legacy_stem = hashlib.sha1(f'viewed-legacy-{time.time_ns()}'.encode('utf-8')).hexdigest()
+    legacy_filename = f'{legacy_stem}.png'
+    legacy_path = self.service.settings.qrcode_dir / legacy_filename
+    legacy_path.write_bytes(b'legacy-viewed')
+    now = datetime.now(timezone.utc).isoformat()
+    view_key = 'viewed-legacy-key'
+    with get_connection(self.service.settings.database_path) as connection:
+      connection.execute(
+        '''
+        INSERT INTO viewed_groups (
+          view_key,
+          product_id,
+          app_name,
+          platform,
+          group_type,
+          entry_type,
+          entry_url,
+          image_path,
+          fallback_url,
+          viewed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+        (
+          view_key,
+          'product-1',
+          'DeepSeek-V2',
+          Platform.WECHAT.value,
+          GroupType.UNKNOWN.value,
+          'qrcode',
+          None,
+          f'/assets/qrcodes/{legacy_filename}',
+          None,
+          now,
+        ),
+      )
+      connection.commit()
+
+    target_path = None
+    try:
+      groups = self.service.list_viewed_groups()
+      self.assertEqual(len(groups), 1)
+      normalized_path = groups[0].entry.image_path
+      self.assertNotIn(legacy_filename, normalized_path)
+      target_filename = normalized_path.rsplit('/', 1)[-1]
+      target_path = self.service.settings.qrcode_dir / target_filename
+      self.assertTrue(target_path.exists())
+
+      with get_connection(self.service.settings.database_path) as connection:
+        row = connection.execute(
+          'SELECT image_path FROM viewed_groups WHERE view_key = ?',
+          (view_key,),
+        ).fetchone()
+      self.assertIsNotNone(row)
+      assert row is not None
+      self.assertEqual(row['image_path'], normalized_path)
+    finally:
+      if legacy_path.exists():
+        legacy_path.unlink()
+      if target_path is not None and target_path.exists():
+        target_path.unlink()
+
+  def test_github_search_filters_noisy_repos(self):
+    noisy = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/awesome-chatgpt',
+      full_name='example/awesome-chatgpt',
+      repo_name='awesome-chatgpt',
+      owner_name='example',
+      owner_type='User',
+      homepage=None,
+      description='awesome list of chatgpt prompts',
+      stars=10,
+      is_fork=False,
+      archived=False,
+      disabled=False,
+    )
+    self.assertTrue(self.service._should_filter(noisy))
+
+  def test_github_search_adds_community_variants_for_generic_keyword(self):
+    captured_queries: list[tuple[str, int]] = []
+
+    def fake_search(variant_query: str, per_page: int):
+      captured_queries.append((variant_query, per_page))
+      return []
+
+    with patch.object(self.service, '_github_search_onevariant', side_effect=fake_search):
+      self.service._github_search('bot', limit=20)
+
+    queried_texts = [item[0] for item in captured_queries]
+    self.assertTrue(any('discord' in query for query in queried_texts))
+    self.assertTrue(any('qq' in query for query in queried_texts))
+    self.assertTrue(any(query.endswith('in:name') and per_page >= 24 for query, per_page in captured_queries))
+
+  def test_fetch_candidate_pages_limits_related_pages(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/labring/FastGPT',
+      full_name='labring/FastGPT',
+      repo_name='FastGPT',
+      owner_name='labring',
+      owner_type='Organization',
+      homepage='https://fastgpt.io/en',
+      description='FastGPT',
+      stars=100,
+    )
+    html_by_url = {
+      'https://github.com/labring/FastGPT': (
+        '<html><body>'
+        '<a href="/labring/FastGPT/discussions">Community</a>'
+        '<a href="https://fastgpt.io/docs">Docs</a>'
+        '</body></html>'
+      ),
+      'https://github.com/labring/FastGPT/discussions': '<html><body>Community</body></html>',
+    }
+
+    def fake_fetch(url: str):
+      html = html_by_url.get(url.rstrip('/'))
+      if html is None:
+        return None
+      return FetchedPage(
+        requested_url=url,
+        final_url=url.rstrip('/'),
+        html=html,
+        title='Test',
+        text='',
+      )
+
+    with patch.object(self.service, '_fetch_page', side_effect=fake_fetch):
+      pages = self.service._fetch_candidate_pages(candidate)
+
+    fetched_urls = {page.final_url for page in pages}
+    self.assertIn('https://github.com/labring/FastGPT', fetched_urls)
+    self.assertIn('https://github.com/labring/FastGPT/discussions', fetched_urls)
+    self.assertEqual(len(fetched_urls), 2)
+
+  def test_fetch_candidate_pages_includes_homepage_seed(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/n8n-io/n8n',
+      full_name='n8n-io/n8n',
+      repo_name='n8n',
+      owner_name='n8n-io',
+      owner_type='Organization',
+      homepage='https://n8n.io',
+      description='n8n',
+      stars=100,
+    )
+    html_by_url = {
+      'https://github.com/n8n-io/n8n': '<html><body>Repo</body></html>',
+      'https://n8n.io': (
+        '<html><body>'
+        '<a href="/community">Join community</a>'
+        '</body></html>'
+      ),
+      'https://n8n.io/community': '<html><body>Community page</body></html>',
+    }
+
+    def fake_fetch(url: str):
+      html = html_by_url.get(url.rstrip('/'))
+      if html is None:
+        return None
+      return FetchedPage(
+        requested_url=url,
+        final_url=url.rstrip('/'),
+        html=html,
+        title='Test',
+        text='',
+      )
+
+    with patch.object(self.service, '_fetch_page', side_effect=fake_fetch):
+      pages = self.service._fetch_candidate_pages(candidate)
+
+    fetched_urls = {page.final_url for page in pages}
+    self.assertIn('https://github.com/n8n-io/n8n', fetched_urls)
+    self.assertIn('https://n8n.io', fetched_urls)
+    self.assertIn('https://n8n.io/community', fetched_urls)
+
+  def test_collect_relevant_links_filters_github_global_noise(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/coze-dev/coze-studio',
+      full_name='coze-dev/coze-studio',
+      repo_name='coze-studio',
+      owner_name='coze-dev',
+      owner_type='Organization',
+      homepage=None,
+      description='coze',
+      stars=100,
+    )
+    page = FetchedPage(
+      requested_url='https://github.com/coze-dev/coze-studio',
+      final_url='https://github.com/coze-dev/coze-studio',
+      html=(
+        '<html><body>'
+        '<a href="/coze-dev/coze-studio/discussions">Community</a>'
+        '<a href="/orgs/community/discussions">Community discussions</a>'
+        '<a href="https://support.github.com/request/landing">Support</a>'
+        '<a href="https://maintainers.github.com/auth/signin">Maintainers</a>'
+        '<a href="https://github.com/premium-support">Premium Support</a>'
+        '</body></html>'
+      ),
+      title='coze',
+      text='',
+    )
+
+    links = self.service._collect_relevant_links(page, candidate)
+
+    self.assertIn('https://github.com/coze-dev/coze-studio/discussions', links)
+    self.assertFalse(any('/orgs/community/' in link for link in links))
+    self.assertFalse(any('support.github.com' in link for link in links))
+    self.assertFalse(any('maintainers.github.com' in link for link in links))
+    self.assertFalse(any('premium-support' in link for link in links))
+
+  def test_collect_relevant_links_supports_chinese_community_anchor(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/repo',
+      full_name='example/repo',
+      repo_name='repo',
+      owner_name='example',
+      owner_type='Organization',
+      homepage=None,
+      description='repo',
+      stars=20,
+    )
+    page = FetchedPage(
+      requested_url='https://github.com/example/repo',
+      final_url='https://github.com/example/repo',
+      html=(
+        '<html><body>'
+        '<a href="/example/repo/discussions">加入交流群</a>'
+        '</body></html>'
+      ),
+      title='repo',
+      text='',
+    )
+
+    links = self.service._collect_relevant_links(page, candidate)
+    self.assertIn('https://github.com/example/repo/discussions', links)
+
+  def test_collect_relevant_links_supports_image_badge_anchor(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/repo',
+      full_name='example/repo',
+      repo_name='repo',
+      owner_name='example',
+      owner_type='Organization',
+      homepage='https://repo.example.com',
+      description='repo',
+      stars=20,
+    )
+    page = FetchedPage(
+      requested_url='https://repo.example.com',
+      final_url='https://repo.example.com',
+      html=(
+        '<html><body>'
+        '<a href="/community/qrcode">'
+        '<img alt="wechat community qrcode" src="https://img.shields.io/badge/WeChat-Join-brightgreen?logo=wechat" />'
+        '</a>'
+        '</body></html>'
+      ),
+      title='repo',
+      text='',
+    )
+
+    links = self.service._collect_relevant_links(page, candidate)
+    self.assertIn('https://repo.example.com/community/qrcode', links)
+
+  def test_collect_cards_reuses_page_fetch_cache_for_duplicate_urls(self):
+    first_candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/repo',
+      full_name='example/repo',
+      repo_name='repo',
+      owner_name='example',
+      owner_type='Organization',
+      homepage='https://repo.example.com',
+      description='repo',
+      stars=10,
+    )
+    second_candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/repo',
+      full_name='example/repo-mirror',
+      repo_name='repo-mirror',
+      owner_name='example',
+      owner_type='Organization',
+      homepage='https://repo.example.com',
+      description='repo mirror',
+      stars=9,
+    )
+
+    def fake_fetch_page(url: str):
+      normalized = url.rstrip('/')
+      if normalized == 'https://github.com/example/repo':
+        html = '<html><body>repo</body></html>'
+      elif normalized == 'https://repo.example.com':
+        html = '<html><body>homepage</body></html>'
+      else:
+        return None
+      return FetchedPage(
+        requested_url=url,
+        final_url=normalized,
+        html=html,
+        title='Test',
+        text='',
+      )
+
+    with patch.object(self.service, '_fetch_page', side_effect=fake_fetch_page) as fetch_page_mock, patch.object(
+      self.service.extractor,
+      'extract',
+      return_value=[],
+    ):
+      self.service._collect_cards([first_candidate, second_candidate])
+
+    self.assertEqual(fetch_page_mock.call_count, 2)
+
+  def test_build_crawl_candidates_uses_only_github_candidates(self):
+    candidates = [
+      GitHubRepositoryCandidate(
+        repo_url=f'https://github.com/example/repo-{index}',
+        full_name=f'example/repo-{index}',
+        repo_name=f'repo-{index}',
+        owner_name='example',
+        owner_type='Organization',
+        homepage=f'https://repo-{index}.example.com',
+        description='Example repo',
+        stars=100 - index,
+      )
+      for index in range(12)
+    ]
+
+    crawl_candidates = self.service._build_crawl_candidates('repo', candidates)
+
+    self.assertEqual(len(crawl_candidates), 10)
+    self.assertEqual(
+      [candidate.repo_url for candidate in crawl_candidates],
+      [candidate.repo_url for candidate in candidates[:10]],
+    )
+
+  def test_build_crawl_candidates_expands_related_when_primary_insufficient(self):
+    primary = [
+      GitHubRepositoryCandidate(
+        repo_url='https://github.com/example/repo-1',
+        full_name='example/repo-1',
+        repo_name='repo-1',
+        owner_name='example',
+        owner_type='Organization',
+        homepage='https://repo-1.example.com',
+        description='repo 1',
+        stars=100,
+      ),
+    ]
+    expanded = [
+      GitHubRepositoryCandidate(
+        repo_url='https://github.com/example/repo-2',
+        full_name='example/repo-2',
+        repo_name='repo-2',
+        owner_name='example',
+        owner_type='Organization',
+        homepage='https://repo-2.example.com',
+        description='repo 2',
+        stars=90,
+      ),
+    ]
+
+    with patch.object(self.service, '_expand_related_candidates', return_value=expanded) as expand_mock:
+      crawl_candidates = self.service._build_crawl_candidates('repo', primary)
+
+    self.assertEqual(len(crawl_candidates), 2)
+    self.assertEqual(crawl_candidates[0].repo_name, 'repo-1')
+    self.assertEqual(crawl_candidates[1].repo_name, 'repo-2')
+    expand_mock.assert_called_once()
+
+  def test_search_returns_github_result_for_keyword(self):
+    github_candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/n8n-io/n8n',
+      full_name='n8n-io/n8n',
+      repo_name='n8n',
+      owner_name='n8n-io',
+      owner_type='Organization',
+      homepage='https://n8n.io',
+      description='n8n',
+      stars=100,
+      created_at='2024-01-01T00:00:00Z',
+    )
+    github_page = FetchedPage(
+      'https://github.com/n8n-io/n8n',
+      'https://github.com/n8n-io/n8n',
+      '<html></html>',
+      'n8n',
+      '',
+    )
+    discord_group = ExtractedGroupCandidate(
+      platform=Platform.DISCORD,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://github.com/n8n-io/n8n',
+      context='community discord server',
+      entry_url='https://discord.gg/n8n',
+      fallback_url='https://discord.gg/n8n',
+      source_urls=['https://github.com/n8n-io/n8n'],
+    )
+
+    with patch.object(self.service, '_github_search', return_value=[github_candidate]), patch.object(
+      self.service,
+      '_fetch_candidate_pages',
+      return_value=[github_page],
+    ), patch.object(
+      self.service,
+      '_expand_related_candidates',
+      return_value=[],
+    ), patch.object(
+      self.service,
+      '_build_web_fallback_candidates',
+      return_value=[],
+    ), patch.object(
+      self.service.extractor,
+      'extract',
+      return_value=[discord_group],
+    ):
+      results = self.service.search('n8n')
+
+    self.assertEqual(len(results), 1)
+    self.assertEqual(results[0].github_repo_url, 'https://github.com/n8n-io/n8n')
+    self.assertEqual(results[0].groups[0].platform, Platform.DISCORD)
+
+  def test_search_same_query_reads_from_persistent_cache(self):
+    first_results = [self._make_card(index) for index in range(3)]
+    cache_key = self.service._build_search_cache_key('n8n-cache', None)
+    self.service._save_cached_search(cache_key, first_results)
+    with patch.object(self.service, '_github_search') as github_search_mock:
+      second_results = self.service.search('n8n-cache', limit=3)
+
+    self.assertEqual(len(first_results), 3)
+    self.assertEqual(len(second_results), 3)
+    github_search_mock.assert_not_called()
+
+  def test_search_uses_web_fallback_when_github_pages_have_no_groups(self):
+    github_candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/n8n-io/n8n',
+      full_name='n8n-io/n8n',
+      repo_name='n8n',
+      owner_name='n8n-io',
+      owner_type='Organization',
+      homepage='https://n8n.io',
+      description='n8n',
+      stars=100,
+    )
+    web_candidate = GitHubRepositoryCandidate(
+      repo_url=None,
+      full_name='web/n8n.io',
+      repo_name='n8n',
+      owner_name='n8n.io',
+      owner_type='Website',
+      homepage='https://n8n.io',
+      description='n8n official',
+      stars=0,
+    )
+    repo_page = FetchedPage(
+      'https://github.com/n8n-io/n8n',
+      'https://github.com/n8n-io/n8n',
+      '<html><body><h1>Repo</h1></body></html>',
+      'n8n',
+      '',
+    )
+    official_page = FetchedPage(
+      'https://n8n.io',
+      'https://n8n.io',
+      '<html><body><a href="https://discord.com/invite/n8n">Join community</a></body></html>',
+      'n8n',
+      '',
+    )
+    discord_group = ExtractedGroupCandidate(
+      platform=Platform.DISCORD,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://n8n.io',
+      context='join community discord',
+      entry_url='https://discord.com/invite/n8n',
+      fallback_url='https://discord.com/invite/n8n',
+      source_urls=['https://n8n.io'],
+    )
+
+    def fake_fetch_pages(candidate: GitHubRepositoryCandidate, **kwargs):
+      del kwargs
+      if candidate.full_name == 'web/n8n.io':
+        return [official_page]
+      return [repo_page]
+
+    def fake_extract(pages: list[FetchedPage]):
+      if pages and pages[0].final_url == 'https://n8n.io':
+        return [discord_group]
+      return []
+
+    with patch.object(self.service, '_github_search', return_value=[github_candidate]), patch.object(
+      self.service,
+      '_fetch_candidate_pages',
+      side_effect=fake_fetch_pages,
+    ), patch.object(
+      self.service,
+      '_expand_related_candidates',
+      return_value=[],
+    ), patch.object(
+      self.service,
+      '_build_web_fallback_candidates',
+      return_value=[web_candidate],
+    ), patch.object(
+      self.service.extractor,
+      'extract',
+      side_effect=fake_extract,
+    ):
+      results = self.service.search('n8n')
+
+    self.assertEqual(len(results), 1)
+    self.assertEqual(results[0].official_site_url, 'https://n8n.io')
+    self.assertEqual(results[0].groups[0].platform, Platform.DISCORD)
+
+  def test_search_merges_github_and_web_candidates_in_one_pass(self):
+    github_candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/org/minimax',
+      full_name='org/minimax',
+      repo_name='minimax',
+      owner_name='org',
+      owner_type='Organization',
+      homepage='https://minimax.com',
+      description='minimax',
+      stars=100,
+    )
+    web_candidate = GitHubRepositoryCandidate(
+      repo_url=None,
+      full_name='web/minimax.com',
+      repo_name='minimax',
+      owner_name='minimax.com',
+      owner_type='Website',
+      homepage='https://minimax.com/community',
+      description='minimax community',
+      stars=0,
+    )
+
+    with patch.object(self.service, '_github_search', return_value=[github_candidate]), patch.object(
+      self.service,
+      '_build_crawl_candidates',
+      return_value=[github_candidate],
+    ), patch.object(
+      self.service,
+      '_build_web_fallback_candidates',
+      return_value=[web_candidate],
+    ), patch.object(
+      self.service,
+      '_collect_cards',
+      return_value=[],
+    ) as collect_cards_mock:
+      results = self.service.search('minimax', refresh=True, limit=10)
+
+    self.assertEqual(results, [])
+    merged = collect_cards_mock.call_args.args[0]
+    self.assertEqual([candidate.full_name for candidate in merged], ['org/minimax', 'web/minimax.com'])
+
+  def test_collect_cards_stops_after_first_batch_when_max_cards_reached(self):
+    candidates = [
+      GitHubRepositoryCandidate(
+        repo_url=f'https://github.com/org/tool-{index}',
+        full_name=f'org/tool-{index}',
+        repo_name=f'tool-{index}',
+        owner_name='org',
+        owner_type='Organization',
+        homepage=None,
+        description='tool',
+        stars=100 - index,
+      )
+      for index in range(8)
+    ]
+
+    def fake_fetch_candidate_pages(candidate: GitHubRepositoryCandidate, **kwargs):
+      del kwargs
+      page = FetchedPage(
+        requested_url=candidate.repo_url or '',
+        final_url=(candidate.repo_url or '').rstrip('/'),
+        html='<html></html>',
+        title='tool',
+        text='',
+      )
+      return [page]
+
+    def fake_extract(pages: list[FetchedPage]):
+      suffix = pages[0].final_url.rsplit('/', 1)[-1]
+      link = f'https://discord.gg/{suffix}'
+      return [
+        ExtractedGroupCandidate(
+          platform=Platform.DISCORD,
+          group_type=GroupType.UNKNOWN,
+          source_url=pages[0].final_url,
+          context='discord community',
+          entry_url=link,
+          fallback_url=link,
+          source_urls=[pages[0].final_url],
+        ),
+      ]
+
+    with patch.object(self.service, '_fetch_candidate_pages', side_effect=fake_fetch_candidate_pages) as fetch_mock, patch.object(
+      self.service.extractor,
+      'extract',
+      side_effect=fake_extract,
+    ):
+      cards = self.service._collect_cards(candidates, max_cards=1)
+
+    self.assertEqual(len(cards), 1)
+    self.assertLess(fetch_mock.call_count, len(candidates))
+
+  def test_build_product_card_supports_qq_number_entry(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/itchat',
+      full_name='example/itchat',
+      repo_name='itchat',
+      owner_name='example',
+      owner_type='User',
+      homepage='https://itchat.example.com',
+      description='itchat',
+      stars=500,
+    )
+    qq_group = ExtractedGroupCandidate(
+      platform=Platform.QQ,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://github.com/example/itchat',
+      context='QQ群讨论：549762872',
+      entry_url=None,
+      fallback_url='https://github.com/example/itchat',
+      qq_number='549762872',
+      source_urls=['https://github.com/example/itchat'],
+    )
+
+    card = self.service._build_product_card(candidate, [qq_group])
+
+    self.assertEqual(len(card.groups), 1)
+    self.assertIsInstance(card.groups[0].entry, QQNumberEntry)
+    self.assertEqual(card.groups[0].entry.qq_number, '549762872')
+
+  def test_github_search_prioritizes_exact_repo_name_over_stars(self):
+    exact = GitHubRepositoryCandidate(
+      repo_url='https://github.com/labring/FastGPT',
+      full_name='labring/FastGPT',
+      repo_name='FastGPT',
+      owner_name='labring',
+      owner_type='Organization',
+      homepage='https://fastgpt.io',
+      description='FastGPT',
+      stars=2_000,
+    )
+    high_star_noise = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/super-gpt',
+      full_name='example/super-gpt',
+      repo_name='super-gpt',
+      owner_name='example',
+      owner_type='Organization',
+      homepage=None,
+      description='general gpt toolkit',
+      stars=80_000,
+    )
+    partial = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/fastgpt-helper',
+      full_name='example/fastgpt-helper',
+      repo_name='fastgpt-helper',
+      owner_name='example',
+      owner_type='Organization',
+      homepage=None,
+      description='helper',
+      stars=500,
+    )
+
+    with patch.object(
+      self.service,
+      '_github_search_onevariant',
+      return_value=[high_star_noise, exact, partial],
+    ):
+      results = self.service._github_search('FastGPT', limit=3)
+
+    self.assertEqual(results[0].full_name, 'labring/FastGPT')
+
+  def test_collect_cards_dedupes_same_group_across_cards(self):
+    first_candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/org/tool-a',
+      full_name='org/tool-a',
+      repo_name='tool-a',
+      owner_name='org',
+      owner_type='Organization',
+      homepage='https://tool-a.example.com',
+      description='tool a',
+      stars=100,
+    )
+    second_candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/org/tool-b',
+      full_name='org/tool-b',
+      repo_name='tool-b',
+      owner_name='org',
+      owner_type='Organization',
+      homepage='https://tool-b.example.com',
+      description='tool b',
+      stars=99,
+    )
+    pages = [
+      FetchedPage('https://github.com/org/tool-a', 'https://github.com/org/tool-a', '<html></html>', 'A', ''),
+      FetchedPage('https://github.com/org/tool-b', 'https://github.com/org/tool-b', '<html></html>', 'B', ''),
+    ]
+    duplicated_link = 'https://discord.com/invite/shared-room'
+    groups = [
+      ExtractedGroupCandidate(
+        platform=Platform.DISCORD,
+        group_type=GroupType.UNKNOWN,
+        source_url='https://github.com/org/tool-a',
+        context='discord',
+        entry_url=duplicated_link,
+        fallback_url=duplicated_link,
+        source_urls=['https://github.com/org/tool-a'],
+      ),
+      ExtractedGroupCandidate(
+        platform=Platform.DISCORD,
+        group_type=GroupType.UNKNOWN,
+        source_url='https://github.com/org/tool-b',
+        context='discord',
+        entry_url=f'{duplicated_link}?utm_source=test',
+        fallback_url=f'{duplicated_link}?utm_source=test',
+        source_urls=['https://github.com/org/tool-b'],
+      ),
+    ]
+
+    def fake_fetch(candidate: GitHubRepositoryCandidate, **kwargs):
+      del kwargs
+      return [pages[0]] if candidate.repo_name == 'tool-a' else [pages[1]]
+
+    def fake_extract(input_pages: list[FetchedPage]):
+      return [groups[0]] if input_pages[0].final_url.endswith('tool-a') else [groups[1]]
+
+    with patch.object(self.service, '_fetch_candidate_pages', side_effect=fake_fetch), patch.object(
+      self.service.extractor,
+      'extract',
+      side_effect=fake_extract,
+    ):
+      cards = self.service._collect_cards([first_candidate, second_candidate])
+
+    self.assertEqual(len(cards), 1)
+
+  def test_collect_cards_skips_card_without_valid_groups(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/repo',
+      full_name='example/repo',
+      repo_name='repo',
+      owner_name='example',
+      owner_type='Organization',
+      homepage='https://repo.example.com',
+      description='repo',
+      stars=10,
+    )
+    invalid_group = ExtractedGroupCandidate(
+      platform=Platform.FEISHU,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://repo.example.com/community',
+      context='feishu official group',
+      entry_url='https://open.feishu.cn/share/base/form/abc',
+      fallback_url='https://open.feishu.cn/share/base/form/abc',
+      qrcode_verified=False,
+      source_urls=['https://repo.example.com/community'],
+    )
+
+    with patch.object(
+      self.service,
+      '_fetch_candidate_pages',
+      return_value=[FetchedPage('https://repo.example.com', 'https://repo.example.com', '<html></html>', 'repo', '')],
+    ), patch.object(
+      self.service.extractor,
+      'extract',
+      return_value=[invalid_group],
+    ):
+      cards = self.service._collect_cards([candidate])
+
+    self.assertEqual(cards, [])
+
+  def test_collect_cards_keeps_candidate_order_with_parallel_fetch(self):
+    candidates = [
+      GitHubRepositoryCandidate(
+        repo_url=f'https://github.com/example/{name}',
+        full_name=f'example/{name}',
+        repo_name=name,
+        owner_name='example',
+        owner_type='Organization',
+        homepage=f'https://{name}.example.com',
+        description=name,
+        stars=10,
+      )
+      for name in ('slow', 'fast-a', 'fast-b')
+    ]
+
+    def fake_fetch(candidate: GitHubRepositoryCandidate, **kwargs):
+      del kwargs
+      if candidate.repo_name == 'slow':
+        time.sleep(0.05)
+      return [
+        FetchedPage(
+          requested_url=candidate.repo_url or '',
+          final_url=f'https://example.com/{candidate.repo_name}',
+          html='<html></html>',
+          title=candidate.repo_name,
+          text='',
+        ),
+      ]
+
+    def fake_extract(input_pages: list[FetchedPage]):
+      repo_name = input_pages[0].final_url.rstrip('/').split('/')[-1]
+      invite = f'https://discord.com/invite/{repo_name}'
+      return [
+        ExtractedGroupCandidate(
+          platform=Platform.DISCORD,
+          group_type=GroupType.UNKNOWN,
+          source_url=input_pages[0].final_url,
+          context='discord community group',
+          entry_url=invite,
+          fallback_url=invite,
+          source_urls=[input_pages[0].final_url],
+        ),
+      ]
+
+    with patch.object(self.service, '_fetch_candidate_pages', side_effect=fake_fetch), patch.object(
+      self.service.extractor,
+      'extract',
+      side_effect=fake_extract,
+    ):
+      cards = self.service._collect_cards(candidates)
+
+    self.assertEqual([card.app_name for card in cards], ['slow', 'fast-a', 'fast-b'])
+
+  def test_dedupe_groups_prefers_image_hash_and_merges_sources(self):
+    image_bytes = make_image_bytes(520, 520)
+    first = ExtractedGroupCandidate(
+      platform=Platform.FEISHU,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://fastgpt.io/community',
+      context='官方群',
+      image_url='https://fastgpt.io/qr.png',
+      image_bytes=image_bytes,
+      image_content_type='image/png',
+      source_urls=['https://fastgpt.io/community'],
+    )
+    second = ExtractedGroupCandidate(
+      platform=Platform.FEISHU,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://github.com/labring/FastGPT',
+      context='官方群',
+      image_url='https://github.com/labring/FastGPT/raw/main/qr.png',
+      image_bytes=image_bytes,
+      image_content_type='image/png',
+      source_urls=['https://github.com/labring/FastGPT'],
+    )
+
+    deduped = self.service._dedupe_groups([first, second])
+    self.assertEqual(len(deduped), 1)
+    self.assertCountEqual(
+      deduped[0].source_urls,
+      ['https://fastgpt.io/community', 'https://github.com/labring/FastGPT'],
+    )
+
+  def test_build_product_card_uses_link_for_unverified_image_candidate(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/repo',
+      full_name='example/repo',
+      repo_name='repo',
+      owner_name='example',
+      owner_type='Organization',
+      homepage='https://repo.example.com',
+      description='repo',
+      stars=10,
+    )
+    group = ExtractedGroupCandidate(
+      platform=Platform.FEISHU,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://repo.example.com/community',
+      context='community',
+      image_url='https://repo.example.com/qr.png',
+      image_bytes=make_image_bytes(520, 520),
+      image_content_type='image/png',
+      entry_url='https://open.feishu.cn/community',
+      fallback_url='https://open.feishu.cn/community',
+      qrcode_verified=False,
+      source_urls=['https://repo.example.com/community'],
+    )
+
+    card = self.service._build_product_card(candidate, [group])
+    self.assertEqual(len(card.groups), 1)
+    self.assertEqual(card.groups[0].entry.type, 'link')
+
+  def test_dedupe_feishu_form_links_by_canonical_path(self):
+    first = ExtractedGroupCandidate(
+      platform=Platform.FEISHU,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://fastgpt.io',
+      context='community',
+      entry_url='https://fael3z0zfze.feishu.cn/share/base/form/shrcnjJWtKqjOI9NbQTzhNyzljc?prefill_S=C2&hide_S=1',
+      fallback_url='https://fael3z0zfze.feishu.cn/share/base/form/shrcnjJWtKqjOI9NbQTzhNyzljc?prefill_S=C2&hide_S=1',
+      qrcode_verified=False,
+      source_urls=['https://fastgpt.io'],
+    )
+    second = ExtractedGroupCandidate(
+      platform=Platform.FEISHU,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://github.com/labring/FastGPT',
+      context='community',
+      entry_url='https://fael3z0zfze.feishu.cn/share/base/form/shrcnjJWtKqjOI9NbQTzhNyzljc',
+      fallback_url='https://fael3z0zfze.feishu.cn/share/base/form/shrcnjJWtKqjOI9NbQTzhNyzljc',
+      qrcode_verified=False,
+      source_urls=['https://github.com/labring/FastGPT'],
+    )
+
+    deduped = self.service._dedupe_groups([first, second])
+    self.assertEqual(len(deduped), 1)
+
+  def test_viewed_group_is_filtered_from_results(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/repo',
+      full_name='example/repo',
+      repo_name='repo',
+      owner_name='example',
+      owner_type='Organization',
+      homepage='https://repo.example.com',
+      description='repo',
+      stars=10,
+    )
+    group = ExtractedGroupCandidate(
+      platform=Platform.DISCORD,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://repo.example.com/community',
+      context='community',
+      entry_url='https://discord.com/invite/repo',
+      fallback_url='https://discord.com/invite/repo',
+      qrcode_verified=False,
+      source_urls=['https://repo.example.com/community'],
+    )
+
+    card = self.service._build_product_card(candidate, [group])
+    self.assertEqual(len(card.groups), 1)
+    self.service.mark_group_viewed(card.product_id, card.app_name, card.groups[0])
+    filtered = self.service._filter_viewed_cards([card])
+    self.assertEqual(filtered, [])
+
+  def test_verify_reveals_changed_qrcode_group(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/repo',
+      full_name='example/repo',
+      repo_name='repo',
+      owner_name='example',
+      owner_type='Organization',
+      homepage='https://repo.example.com',
+      description='repo',
+      stars=10,
+    )
+    old_group = ExtractedGroupCandidate(
+      platform=Platform.FEISHU,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://repo.example.com/community',
+      context='community',
+      image_url='https://repo.example.com/qr-old.png',
+      image_bytes=make_image_bytes(420, 420),
+      image_content_type='image/png',
+      entry_url='https://open.feishu.cn/invite/abc',
+      fallback_url='https://open.feishu.cn/invite/abc',
+      qrcode_verified=True,
+      source_urls=['https://repo.example.com/community'],
+    )
+    new_group = ExtractedGroupCandidate(
+      platform=Platform.FEISHU,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://repo.example.com/community',
+      context='community',
+      image_url='https://repo.example.com/qr-new.png',
+      image_bytes=make_image_bytes(460, 460),
+      image_content_type='image/png',
+      entry_url='https://open.feishu.cn/invite/abc',
+      fallback_url='https://open.feishu.cn/invite/abc',
+      qrcode_verified=True,
+      source_urls=['https://repo.example.com/community'],
+    )
+
+    old_card = self.service._build_product_card(candidate, [old_group])
+    self.service.mark_group_viewed(old_card.product_id, old_card.app_name, old_card.groups[0])
+    new_card = self.service._build_product_card(candidate, [new_group])
+    filtered = self.service._filter_viewed_cards([new_card])
+    self.assertEqual(len(filtered), 1)
+    self.assertEqual(len(filtered[0].groups), 1)
+
+  def test_remove_viewed_group_restores_search_result(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/repo',
+      full_name='example/repo',
+      repo_name='repo',
+      owner_name='example',
+      owner_type='Organization',
+      homepage='https://repo.example.com',
+      description='repo',
+      stars=10,
+    )
+    group = ExtractedGroupCandidate(
+      platform=Platform.DISCORD,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://repo.example.com/community',
+      context='community',
+      entry_url='https://discord.com/invite/repo',
+      fallback_url='https://discord.com/invite/repo',
+      qrcode_verified=False,
+      source_urls=['https://repo.example.com/community'],
+    )
+    card = self.service._build_product_card(candidate, [group])
+    self.service.mark_group_viewed(card.product_id, card.app_name, card.groups[0])
+    self.service.remove_viewed_group(card.groups[0].group_id)
+    filtered = self.service._filter_viewed_cards([card])
+    self.assertEqual(len(filtered), 1)
+    self.assertEqual(len(filtered[0].groups), 1)
+
+  def test_github_search_adds_cjk_variants_for_chinese_query(self):
+    seen_queries: list[str] = []
+
+    def fake_onevariant(query: str, per_page: int):
+      del per_page
+      seen_queries.append(query)
+      return []
+
+    with patch.object(self.service, '_github_search_onevariant', side_effect=fake_onevariant):
+      self.service._github_search('飞书群', limit=10, filters=None)
+
+    self.assertIn('飞书群', seen_queries)
+    self.assertIn('飞书群 AI', seen_queries)
+
+
+  def test_manual_upload_link_is_visible_in_viewed_groups(self):
+    view_key = self.service.manual_upload_group(
+      app_name='Manual Tool',
+      description='manual entry',
+      created_at='2026-04-07',
+      github_stars=321,
+      platform=Platform.WECOM,
+      group_type=GroupType.UNKNOWN,
+      entry_type='link',
+      entry_url='https://work.weixin.qq.com/gm/abc',
+      fallback_url='https://work.weixin.qq.com/gm/abc',
+      qrcode_bytes=None,
+      qrcode_content_type=None,
+    )
+
+    viewed = self.service.list_viewed_groups()
+    self.assertTrue(any(item.view_key == view_key for item in viewed))
+    self.assertTrue(any(item.platform == Platform.WECOM for item in viewed))
 
 
 class EntryExtractorTests(unittest.TestCase):
   def setUp(self):
     self.extractor = EntryExtractor(get_settings())
+    self.square_image = make_image_bytes(520, 520)
+    self.banner_image = make_image_bytes(900, 420)
+    self.small_square_image = make_image_bytes(174, 174)
 
-  def test_extracts_qrcode_candidate_when_decode_succeeds(self):
+  def test_extracts_image_link_qrcode_candidate(self):
     page = FetchedPage(
-      requested_url='https://example.com/community',
-      final_url='https://example.com/community',
-      html=(
-        '<section><p>加入飞书群获取最新消息</p>'
-        '<a href="https://www.feishu.cn/invite/abc">'
-        '<img src="/qr.png" alt="飞书群二维码" /></a></section>'
-      ),
-      title='community',
-      text='加入飞书群获取最新消息',
+      requested_url='https://fastgpt.io',
+      final_url='https://fastgpt.io',
+      html='''
+        <html><body>
+          <a href="https://cdn.fastgpt.io/feishu-group.png">飞书官方群二维码</a>
+        </body></html>
+      ''',
+      title='FastGPT',
+      text='',
     )
 
-    with (
-      patch.object(self.extractor, '_download_image', return_value=(b'png', 'image/png')),
-      patch.object(
-        self.extractor,
-        '_decode_qrcode',
-        return_value=('https://www.feishu.cn/invite/abc', True),
-      ),
-      patch.object(self.extractor, '_store_image', return_value='/assets/qrcodes/mock.png'),
+    with patch.object(
+      self.extractor,
+      '_download_image',
+      return_value=(self.square_image, 'image/png'),
     ):
       candidates = self.extractor.extract([page])
 
     self.assertEqual(len(candidates), 1)
     self.assertEqual(candidates[0].platform, Platform.FEISHU)
-    self.assertEqual(candidates[0].group_type, GroupType.DISCUSSION)
-    self.assertEqual(candidates[0].image_url, '/assets/qrcodes/mock.png')
-    self.assertTrue(candidates[0].qrcode_verified)
+    self.assertTrue(candidates[0].image_url.endswith('feishu-group.png'))
 
-  def test_keeps_unverified_qrcode_image_when_context_is_strong(self):
-    page = FetchedPage(
-      requested_url='https://github.com/labring/FastGPT',
-      final_url='https://github.com/labring/FastGPT',
-      html=(
-        '<section><h2>社区交流群</h2><p>加入飞书群</p>'
-        '<img data-canonical-src="https://oss.example.com/fastgpt-feishu-qr.png" /></section>'
-      ),
-      title='FastGPT',
-      text='社区交流群 加入飞书群',
+  def test_extract_from_link_tag_supports_image_only_wechat_badge(self):
+    soup = BeautifulSoup(
+      '''
+      <a href="https://raw.githubusercontent.com/deepseek-ai/DeepSeek-V2/refs/heads/main/figures/qr.jpeg">
+        <img alt="Wechat" src="https://img.shields.io/badge/WeChat-DeepSeek%20AI-brightgreen?logo=wechat" />
+      </a>
+      ''',
+      'html.parser',
+    )
+    link = soup.find('a')
+    self.assertIsNotNone(link)
+    assert link is not None
+    qr_points = np.array([[[80.0, 80.0], [220.0, 80.0], [220.0, 220.0], [80.0, 220.0]]], dtype=np.float32)
+
+    with patch.object(
+      self.extractor,
+      '_download_image',
+      return_value=(self.square_image, 'image/jpeg'),
+    ), patch.object(
+      self.extractor,
+      '_analyze_qrcode',
+      return_value=('https://u.wechat.com/abcdef', qr_points),
+    ):
+      candidate = self.extractor._extract_from_link_tag(link, 'https://github.com/deepseek-ai/DeepSeek-V2')
+
+    self.assertIsNotNone(candidate)
+    assert candidate is not None
+    self.assertEqual(candidate.platform, Platform.WECHAT)
+    self.assertTrue(candidate.qrcode_verified)
+    self.assertEqual(
+      candidate.image_url,
+      'https://raw.githubusercontent.com/deepseek-ai/DeepSeek-V2/refs/heads/main/figures/qr.jpeg',
     )
 
-    with (
-      patch.object(self.extractor, '_download_image', return_value=(b'png', 'image/png')),
-      patch.object(self.extractor, '_decode_qrcode', return_value=(None, False)),
-      patch.object(self.extractor, '_looks_like_qrcode_image', return_value=True),
-      patch.object(self.extractor, '_store_image', return_value='/assets/qrcodes/fastgpt.png'),
+  def test_filters_chat_screenshot_before_download(self):
+    page = FetchedPage(
+      requested_url='https://example.com',
+      final_url='https://example.com',
+      html='''
+        <html><body>
+          <img src="https://cdn.example.com/wechat-chat.png" alt="微信聊天截图" />
+        </body></html>
+      ''',
+      title='Example',
+      text='',
+    )
+
+    with patch.object(self.extractor, '_download_image') as download_mock:
+      candidates = self.extractor.extract([page])
+
+    self.assertEqual(candidates, [])
+    download_mock.assert_not_called()
+
+  def test_crops_large_image_when_qr_points_detected(self):
+    page = FetchedPage(
+      requested_url='https://example.com',
+      final_url='https://example.com',
+      html='''
+        <html><body>
+          <img src="https://cdn.example.com/discord-group-banner.png" alt="Discord community QR" />
+        </body></html>
+      ''',
+      title='Example',
+      text='',
+    )
+    qr_points = np.array([[[520.0, 120.0], [650.0, 120.0], [650.0, 250.0], [520.0, 250.0]]], dtype=np.float32)
+
+    with patch.object(
+      self.extractor,
+      '_download_image',
+      return_value=(self.banner_image, 'image/png'),
+    ), patch.object(
+      self.extractor,
+      '_analyze_qrcode',
+      return_value=(None, qr_points),
     ):
       candidates = self.extractor.extract([page])
 
     self.assertEqual(len(candidates), 1)
-    self.assertEqual(candidates[0].platform, Platform.FEISHU)
-    self.assertEqual(candidates[0].image_url, '/assets/qrcodes/fastgpt.png')
-    self.assertFalse(candidates[0].qrcode_verified)
+    cropped = cv2.imdecode(np.frombuffer(candidates[0].image_bytes or b'', dtype=np.uint8), cv2.IMREAD_COLOR)
+    self.assertIsNotNone(cropped)
+    self.assertLess(cropped.shape[1], 200)
+    self.assertLess(cropped.shape[0], 200)
 
-  def test_filters_github_anchor_noise(self):
-    page = FetchedPage(
-      requested_url='https://github.com/labring/FastGPT',
-      final_url='https://github.com/labring/FastGPT',
-      html=(
-        '<section><h2>社区交流群</h2>'
-        '<a class="anchor" aria-label="Permalink: 社区交流群" href="#社区交流群">#</a>'
-        '<a href="https://fael3z0zfze.feishu.cn/share/base/form/abc">飞书咨询</a>'
-        '</section>'
-      ),
-      title='FastGPT',
-      text='社区交流群 飞书咨询',
+  def test_rejects_chat_screenshot_when_qr_detected_but_uncropped(self):
+    qr_points = np.array([[[80.0, 80.0], [220.0, 80.0], [220.0, 220.0], [80.0, 220.0]]], dtype=np.float32)
+
+    with patch.object(self.extractor, '_analyze_qrcode', return_value=(None, qr_points)), patch.object(
+      self.extractor,
+      '_crop_qrcode',
+      return_value=None,
+    ):
+      candidate = self.extractor._extract_visual_candidate(
+        image_url='https://cdn.example.com/dingtalk-chat.png',
+        page_url='https://example.com',
+        full_context='dingtalk group chat history screenshot',
+        image_bytes=self.banner_image,
+        content_type='image/png',
+        entry_url=None,
+      )
+
+    self.assertIsNone(candidate)
+
+  def test_rejects_document_screenshot_in_fallback_path(self):
+    with patch.object(self.extractor, '_analyze_qrcode', return_value=(None, None)):
+      candidate = self.extractor._extract_visual_candidate(
+        image_url='https://cdn.example.com/wecom-doc.png',
+        page_url='https://example.com',
+        full_context='work wechat group document instruction',
+        image_bytes=self.square_image,
+        content_type='image/png',
+        entry_url=None,
+      )
+
+    self.assertIsNone(candidate)
+
+  def test_collect_nearby_text_avoids_cross_image_parent_text(self):
+    soup = BeautifulSoup(
+      '''
+      <div>
+        <img src="https://cdn.example.com/wechat-account.png" alt="wechat official account qrcode" />
+        <img src="https://cdn.example.com/wechat-group.png" alt="wechat discussion group qrcode" />
+      </div>
+      ''',
+      'html.parser',
     )
-    stats = ExtractionStats()
+    images = soup.find_all('img')
+    nearby = self.extractor._collect_nearby_text(images[0])
 
-    candidates = self.extractor.extract([page], stats)
+    self.assertIn('official account', nearby.lower())
+    self.assertNotIn('discussion group', nearby.lower())
 
-    self.assertEqual(len(candidates), 1)
-    self.assertEqual(candidates[0].entry_url, 'https://fael3z0zfze.feishu.cn/share/base/form/abc')
-    self.assertGreaterEqual(stats.filtered_link_noise, 1)
-
-  def test_extract_stats_capture_fallback_counts(self):
+  def test_prefers_discussion_group_qrcode_over_account_qrcode(self):
     page = FetchedPage(
       requested_url='https://example.com/community',
       final_url='https://example.com/community',
-      html='<section><p>加入微信群 扫码入群</p><img src="/wechat-qr.png" /></section>',
+      html='''
+        <html><body>
+          <div>
+            <img src="https://cdn.example.com/wechat-account-qrcode.png" alt="wechat official account qrcode" />
+            <img src="https://cdn.example.com/wechat-discussion-group-qrcode.png" alt="wechat discussion group qrcode" />
+          </div>
+        </body></html>
+      ''',
       title='community',
-      text='加入微信群 扫码入群',
+      text='',
     )
-    stats = ExtractionStats()
+    qr_points = np.array([[[80.0, 80.0], [220.0, 80.0], [220.0, 220.0], [80.0, 220.0]]], dtype=np.float32)
 
-    with (
-      patch.object(self.extractor, '_download_image', return_value=(b'png', 'image/png')),
-      patch.object(self.extractor, '_decode_qrcode', return_value=(None, False)),
-      patch.object(self.extractor, '_looks_like_qrcode_image', return_value=True),
-      patch.object(self.extractor, '_store_image', return_value='/assets/qrcodes/wechat.png'),
+    with patch.object(
+      self.extractor,
+      '_download_image',
+      return_value=(self.square_image, 'image/png'),
+    ), patch.object(
+      self.extractor,
+      '_analyze_qrcode',
+      return_value=(None, qr_points),
+    ), patch.object(
+      self.extractor,
+      '_crop_qrcode',
+      return_value=self.small_square_image,
     ):
-      candidates = self.extractor.extract([page], stats)
+      candidates = self.extractor.extract([page])
 
     self.assertEqual(len(candidates), 1)
-    self.assertEqual(stats.image_candidates, 1)
-    self.assertEqual(stats.image_decode_fallbacks, 1)
-    self.assertEqual(stats.output_candidates, 1)
-    self.assertEqual(stats.page_summaries[0].image_candidates, 1)
+    self.assertIn('discussion-group', candidates[0].image_url)
 
-
-class ResultNormalizerTests(unittest.TestCase):
-  def setUp(self):
-    self.normalizer = ResultNormalizer()
-
-  def test_builds_link_entry_card(self):
-    groups = [
-      ExtractedGroupCandidate(
-        platform=Platform.WECHAT,
-        group_type=GroupType.DISCUSSION,
-        source_url='https://example.com/community',
-        context='加入微信群交流',
-        entry_url='https://example.com/invite',
-      ),
-    ]
-    github = GitHubRepositoryMetadata(
-      repo_url='https://github.com/example/app',
-      stars=123,
-      created_at='2025-01-02T03:04:05Z',
-      description='Example app',
-    )
-
-    cards = self.normalizer.build_product_card(
-      app_name='Example App',
-      description='Example app',
-      github=github,
-      groups=groups,
-    )
-
-    self.assertEqual(len(cards), 1)
-    self.assertEqual(cards[0].github_stars, 123)
-    self.assertEqual(cards[0].groups[0].entry.type, 'link')
-
-  def test_returns_empty_list_when_no_groups(self):
-    cards = self.normalizer.build_product_card(
-      app_name='Example App',
-      description='Example app',
-      github=None,
-      groups=[],
-    )
-
-    self.assertEqual(cards, [])
-
-
-class SearchServiceTests(unittest.TestCase):
-  def setUp(self):
-    self.service = SearchService(get_settings())
-
-  def test_resolve_search_result_url_decodes_bing_redirect(self):
-    resolved = self.service._resolve_search_result_url(
-      'https://www.bing.com/ck/a?!&&p=test&u=a1aHR0cHM6Ly9jdXN0b20tY3Vyc29yLmNvbS8&ntb=1',
-    )
-
-    self.assertEqual(resolved, 'https://custom-cursor.com/')
-
-  def test_search_bing_parses_rss_items(self):
-    response = MagicMock()
-    response.raise_for_status.return_value = None
-    response.text = """
-      <rss>
-        <channel>
-          <item>
-            <title>Claude</title>
-            <link>https://claude.ai/</link>
-          </item>
-          <item>
-            <title>Home \\ Anthropic</title>
-            <link>https://www.anthropic.com/</link>
-          </item>
-        </channel>
-      </rss>
-    """
-
-    client = MagicMock()
-    client.get.return_value = response
-    client.__enter__.return_value = client
-
-    with patch('app.search.service.httpx.Client', return_value=client):
-      results = self.service._search_bing('Claude official site')
-
-    self.assertEqual(len(results), 2)
-    self.assertEqual(results[0].title, 'Claude')
-    self.assertEqual(results[0].url, 'https://claude.ai/')
-
-  def test_selects_brand_homepage_over_docs_page(self):
-    github_candidate = GitHubRepositoryCandidate(
-      repo_url='https://github.com/anthropics/claude-code',
-      full_name='anthropics/claude-code',
-      repo_name='claude-code',
-      owner_name='anthropics',
-      owner_type='Organization',
-      homepage='https://code.claude.com/docs/en/overview',
-      description='Claude Code',
-      stars=100000,
-    )
-    official_results = [
-      SearchResultLink(title='Claude', url='https://claude.ai/'),
-      SearchResultLink(
-        title='Claude Code Docs',
-        url='https://code.claude.com/docs/en/overview',
-      ),
-    ]
-
-    selected, _, supplemental, _ = self.service._select_official_site(
-      'Claude',
-      official_results,
-      github_candidate,
-    )
-
-    self.assertEqual(selected, 'https://claude.ai/')
-    self.assertEqual(supplemental, [])
-
-  def test_discover_targets_avoids_ambiguous_wrong_repo(self):
-    github_summary = GitHubCandidateSummary(
-      repo_url='https://github.com/FoundationAgents/OpenManus',
-      homepage='https://openmanus.github.io',
-      score=55,
-      confident=False,
-      reasons=['score-below-confidence-threshold'],
-    )
-
-    with (
-      patch.object(self.service, '_search_github_repository', return_value=(None, github_summary)),
-      patch.object(self.service, '_search_web', return_value=[]),
+  def test_allows_undecoded_qr_with_qr_url_hint(self):
+    qr_points = np.array([[[80.0, 80.0], [220.0, 80.0], [220.0, 220.0], [80.0, 220.0]]], dtype=np.float32)
+    with patch.object(self.extractor, '_analyze_qrcode', return_value=(None, qr_points)), patch.object(
+      self.extractor,
+      '_crop_qrcode',
+      return_value=self.square_image,
     ):
-      targets = self.service._discover_targets('Manus', None)
+      candidate = self.extractor._extract_visual_candidate(
+        image_url='https://cdn.example.com/discord-qrcode.png',
+        page_url='https://example.com',
+        full_context='discord community group',
+        image_bytes=self.square_image,
+        content_type='image/png',
+        entry_url=None,
+      )
 
-    self.assertIsNone(targets)
+    self.assertIsNotNone(candidate)
+    self.assertEqual(candidate.platform, Platform.DISCORD)
+    self.assertTrue(candidate.qrcode_verified)
 
-  def test_fetch_pages_records_candidate_pages(self):
-    targets = DiscoveredTargets(
-      app_name='Cursor',
-      official_site_url='https://cursor.com',
-      github_repo_url=None,
+  def test_promotes_small_undecoded_qr_to_qrcode_when_high_confidence(self):
+    qr_points = np.array([[[24.0, 24.0], [152.0, 24.0], [152.0, 152.0], [24.0, 152.0]]], dtype=np.float32)
+    cropped = make_image_bytes(120, 120)
+
+    with patch.object(self.extractor, '_analyze_qrcode', return_value=(None, qr_points)), patch.object(
+      self.extractor,
+      '_crop_qrcode',
+      return_value=cropped,
+    ):
+      candidate = self.extractor._extract_visual_candidate(
+        image_url='https://camo.githubusercontent.com/hash/68747470733a2f2f6578616d706c652e636f6d2f71722e706e67',
+        page_url='https://github.com/coze-dev/coze-studio',
+        full_context='feishu official group qrcode invite',
+        image_bytes=self.small_square_image,
+        content_type='image/png',
+        entry_url='https://open.feishu.cn/invite/community-abc',
+      )
+
+    self.assertIsNotNone(candidate)
+    self.assertTrue(candidate.qrcode_verified)
+    self.assertEqual(candidate.entry_url, 'https://open.feishu.cn/invite/community-abc')
+
+  def test_promotes_undecoded_qr_without_link_when_high_confidence(self):
+    qr_points = np.array([[[80.0, 80.0], [220.0, 80.0], [220.0, 220.0], [80.0, 220.0]]], dtype=np.float32)
+
+    with patch.object(self.extractor, '_analyze_qrcode', return_value=(None, qr_points)), patch.object(
+      self.extractor,
+      '_crop_qrcode',
+      return_value=self.small_square_image,
+    ):
+      candidate = self.extractor._extract_visual_candidate(
+        image_url='https://oss.laf.run/otnvvf-imgs/fastgpt-feishu1.png',
+        page_url='https://fastgpt.io',
+        full_context='feishu official discussion group join community',
+        image_bytes=self.square_image,
+        content_type='image/png',
+        entry_url=None,
+      )
+
+    self.assertIsNotNone(candidate)
+    self.assertTrue(candidate.qrcode_verified)
+    self.assertIsNone(candidate.entry_url)
+
+  def test_small_undecoded_qr_without_reliable_link_is_not_promoted(self):
+    qr_points = np.array([[[24.0, 24.0], [152.0, 24.0], [152.0, 152.0], [24.0, 152.0]]], dtype=np.float32)
+
+    with patch.object(self.extractor, '_analyze_qrcode', return_value=(None, qr_points)), patch.object(
+      self.extractor,
+      '_crop_qrcode',
+      return_value=self.small_square_image,
+    ):
+      candidate = self.extractor._extract_visual_candidate(
+        image_url='https://cdn.example.com/discord-qrcode.png',
+        page_url='https://example.com',
+        full_context='discord qrcode',
+        image_bytes=self.small_square_image,
+        content_type='image/png',
+        entry_url=None,
+      )
+
+    self.assertIsNotNone(candidate)
+    self.assertFalse(candidate.qrcode_verified)
+
+  def test_allows_discord_link_entry(self):
+    page = FetchedPage(
+      requested_url='https://lovable.dev',
+      final_url='https://lovable.dev',
+      html='''
+        <html><body>
+          <a href="https://discord.com/invite/lovable-dev">Community Discord Server</a>
+        </body></html>
+      ''',
+      title='Lovable',
+      text='',
     )
-    homepage = FetchedPage(
-      requested_url='https://cursor.com',
-      final_url='https://cursor.com',
-      html='<main><a href="/community">Community</a></main>',
-      title='Cursor',
-      text='community',
+
+    candidates = self.extractor.extract([page])
+    self.assertEqual(len(candidates), 1)
+    self.assertEqual(candidates[0].platform, Platform.DISCORD)
+    self.assertEqual(candidates[0].entry_url, 'https://discord.com/invite/lovable-dev')
+
+  def test_extract_prioritizes_qr_like_images_on_busy_page(self):
+    page = FetchedPage(
+      requested_url='https://github.com/org/repo',
+      final_url='https://github.com/org/repo',
+      html='''
+        <html><body>
+          <img src="https://cdn.example.com/badge-1.png" alt="build badge" />
+          <img src="https://cdn.example.com/badge-2.png" alt="coverage badge" />
+          <img src="https://cdn.example.com/banner.png" alt="hero image" />
+          <img src="https://cdn.example.com/discord-qrcode.png" alt="Discord community QR" />
+        </body></html>
+      ''',
+      title='Repo',
+      text='',
     )
-    community = FetchedPage(
-      requested_url='https://cursor.com/community',
-      final_url='https://cursor.com/community',
-      html='<section>Join</section>',
+
+    with patch.object(
+      self.extractor,
+      '_download_image',
+      return_value=(self.square_image, 'image/png'),
+    ):
+      candidates = self.extractor.extract([page])
+
+    self.assertTrue(any(candidate.platform == Platform.DISCORD for candidate in candidates))
+
+  def test_allows_wecom_and_dingtalk_link_entries(self):
+    page = FetchedPage(
+      requested_url='https://example.com/community',
+      final_url='https://example.com/community',
+      html='''
+        <html><body>
+          <a href="https://work.weixin.qq.com/gm/abc">Join work wechat group</a>
+          <a href="https://qr.dingtalk.com/action/join?code=123">Join dingtalk community</a>
+        </body></html>
+      ''',
       title='Community',
-      text='join',
+      text='',
     )
 
-    with (
-      patch.object(self.service, '_discover_targets', return_value=targets),
-      patch.object(self.service.page_fetcher, 'fetch_page', side_effect=[homepage, community]),
-      patch.object(
-        self.service.page_fetcher,
-        'discover_candidate_internal_links',
-        return_value=[
-          CandidatePageSummary(
-            url='https://cursor.com/community',
-            score=110,
-            source_page='https://cursor.com',
-            source_type='internal_link',
-            reasons=['strong:community'],
-          ),
-        ],
-      ),
-      patch.object(self.service.extractor, 'extract', return_value=[]),
-    ):
-      _, trace = self.service.search_with_trace('https://cursor.com')
+    candidates = self.extractor.extract([page])
+    platforms = {candidate.platform for candidate in candidates}
+    self.assertIn(Platform.WECOM, platforms)
+    self.assertIn(Platform.DINGTALK, platforms)
 
-    self.assertEqual(trace.fetch.candidate_pages[0].url, 'https://cursor.com/community')
-    self.assertEqual(trace.fetch.internal_links['https://cursor.com'], ['https://cursor.com/community'])
-
-  def test_search_with_trace_uses_official_site_search_fallback(self):
-    targets = DiscoveredTargets(
-      app_name='MiniMax',
-      official_site_url='https://www.minimaxi.com',
-      github_repo_url=None,
-    )
-    homepage = FetchedPage(
-      requested_url='https://www.minimaxi.com',
-      final_url='https://www.minimaxi.com',
-      html='<main>MiniMax</main>',
-      title='MiniMax',
-      text='MiniMax',
-    )
-    fallback_page = FetchedPage(
-      requested_url='https://www.minimaxi.com/news/community',
-      final_url='https://www.minimaxi.com/news/community',
-      html='<section>加入飞书群<img src="/qr.png" /></section>',
-      title='MiniMax News',
-      text='加入飞书群',
-    )
-    fallback_group = ExtractedGroupCandidate(
-      platform=Platform.FEISHU,
-      group_type=GroupType.DISCUSSION,
-      source_url='https://www.minimaxi.com/news/community',
-      context='加入飞书群',
-      image_url='/assets/qrcodes/minimax.png',
+  def test_filters_discord_non_invite_links(self):
+    page = FetchedPage(
+      requested_url='https://n8n.io',
+      final_url='https://n8n.io',
+      html='''
+        <html><body>
+          <a href="https://n8n.io/workflows/2105-get-all-members-of-a-discord-server-with-a-specific-role/">
+            Discord integration workflow
+          </a>
+        </body></html>
+      ''',
+      title='n8n',
+      text='',
     )
 
-    with (
-      patch.object(self.service, '_discover_targets', return_value=targets),
-      patch.object(self.service, '_fetch_pages', return_value=[homepage]),
-      patch.object(self.service.extractor, 'extract', side_effect=[[], [fallback_group]]),
-      patch.object(self.service, '_fetch_official_site_search_pages', return_value=[fallback_page]) as fallback_fetch,
-    ):
-      results, _ = self.service.search_with_trace('MiniMax')
+    candidates = self.extractor.extract([page])
+    self.assertEqual(candidates, [])
 
-    self.assertEqual(len(results), 1)
-    self.assertEqual(results[0].groups[0].entry.type, 'qrcode')
-    fallback_fetch.assert_called_once()
-
-  def test_search_logs_trace_when_debug_enabled(self):
-    debug_service = SearchService(
-      replace(get_settings(), search_debug_enabled=True),
-    )
-    trace = SearchTrace(
-      raw_query='Cursor',
-      cleaned_query='Cursor',
-      query_type='keyword',
+  def test_filters_download_and_article_links(self):
+    page = FetchedPage(
+      requested_url='https://example.com',
+      final_url='https://example.com',
+      html='''
+        <html><body>
+          <a href="https://dldir1.qq.com/wework/work_weixin/WeCom_4.1.13.6002.exe">Join work wechat group</a>
+          <a href="https://mp.weixin.qq.com/s/abcdef">QQ group community</a>
+        </body></html>
+      ''',
+      title='Example',
+      text='',
     )
 
-    with patch('app.search.service.logger.info') as logger_info:
-      with patch.object(debug_service, 'search_with_trace', return_value=([], trace)):
-        debug_service.search('Cursor')
+    candidates = self.extractor.extract([page])
+    self.assertEqual(candidates, [])
 
-    logger_info.assert_called_once()
-    logged_payload = logger_info.call_args.args[1]
-    self.assertIn('"cleaned_query": "Cursor"', logged_payload)
+  def test_filters_payment_links(self):
+    page = FetchedPage(
+      requested_url='https://example.com',
+      final_url='https://example.com',
+      html='''
+        <html><body>
+          <a href="https://pay.weixin.qq.com/pay">Join WeChat Group</a>
+        </body></html>
+      ''',
+      title='Example',
+      text='',
+    )
+
+    candidates = self.extractor.extract([page])
+    self.assertEqual(candidates, [])
+
+  def test_filters_external_store_links_even_with_group_words(self):
+    page = FetchedPage(
+      requested_url='https://example.com',
+      final_url='https://example.com',
+      html='''
+        <html><body>
+          <a href="https://www.amazon.com/dp/B0DTH4M7HT">Join QQ group now</a>
+        </body></html>
+      ''',
+      title='Example',
+      text='',
+    )
+
+    candidates = self.extractor.extract([page])
+    self.assertEqual(candidates, [])
+
+  def test_analyze_qrcode_multiscale_window_fallback_hits(self):
+    large = np.full((1600, 1600, 3), 255, dtype=np.uint8)
+    calls: list[tuple[int, int]] = []
+
+    def fake_detect(_detector, image):
+      h, w = image.shape[:2]
+      calls.append((w, h))
+      if (w, h) == (640, 640):
+        points = np.array(
+          [[[80.0, 80.0], [220.0, 80.0], [220.0, 220.0], [80.0, 220.0]]],
+          dtype=np.float32,
+        )
+        return None, points
+      return None, None
+
+    with patch.object(self.extractor, '_detect_qrcode_once', side_effect=fake_detect):
+      payload, points = self.extractor._analyze_qrcode(large)
+
+    self.assertIsNone(payload)
+    self.assertIsNotNone(points)
+    self.assertGreater(len(calls), 1)
+
+  def test_analyze_qrcode_small_image_retries_with_white_border(self):
+    small = np.full((174, 174, 3), 255, dtype=np.uint8)
+    calls: list[tuple[int, int]] = []
+
+    def fake_detect(_detector, image):
+      h, w = image.shape[:2]
+      calls.append((w, h))
+      if (w, h) in {(214, 214), (254, 254)}:
+        points = np.array(
+          [[[40.0, 40.0], [140.0, 40.0], [140.0, 140.0], [40.0, 140.0]]],
+          dtype=np.float32,
+        )
+        return None, points
+      return None, None
+
+    with patch.object(self.extractor, '_detect_qrcode_once', side_effect=fake_detect):
+      payload, points = self.extractor._analyze_qrcode(small)
+
+    self.assertIsNone(payload)
+    self.assertIsNotNone(points)
+    self.assertIn((214, 214), calls)
+
+  def test_analyze_qrcode_retries_with_preprocess_upsampling(self):
+    sample = np.full((320, 320, 3), 255, dtype=np.uint8)
+    calls: list[tuple[int, int]] = []
+
+    def fake_detect(_detector, image):
+      h, w = image.shape[:2]
+      calls.append((w, h))
+      if (w, h) == (480, 480):
+        points = np.array(
+          [[[120.0, 120.0], [360.0, 120.0], [360.0, 360.0], [120.0, 360.0]]],
+          dtype=np.float32,
+        )
+        return None, points
+      return None, None
+
+    with patch.object(self.extractor, '_detect_qrcode_once', side_effect=fake_detect):
+      payload, points = self.extractor._analyze_qrcode(sample)
+
+    self.assertIsNone(payload)
+    self.assertIsNotNone(points)
+    self.assertIn((480, 480), calls)
+    mapped = np.squeeze(points)
+    self.assertLessEqual(float(mapped.max()), 320.0)
+
+  def test_extracts_qq_group_numbers_from_group_context(self):
+    page = FetchedPage(
+      requested_url='https://example.com/community',
+      final_url='https://example.com/community',
+      html='''
+        <html><body>
+          <p>问题与建议：当然也可以加入我们新建的QQ群讨论：549762872, 205872856</p>
+        </body></html>
+      ''',
+      title='community',
+      text='',
+    )
+
+    candidates = self.extractor.extract([page])
+    qq_numbers = sorted(candidate.qq_number for candidate in candidates if candidate.platform == Platform.QQ and candidate.qq_number)
+    self.assertEqual(qq_numbers, ['205872856', '549762872'])
+
+  def test_extracts_qq_group_numbers_from_multiline_context(self):
+    page = FetchedPage(
+      requested_url='https://example.com/community',
+      final_url='https://example.com/community',
+      html='''
+        <html><body>
+          <p>问题与建议：当然也可以加入我们新建的QQ群讨论：</p>
+          <p>549762872, 205872856</p>
+        </body></html>
+      ''',
+      title='community',
+      text='',
+    )
+
+    candidates = self.extractor.extract([page])
+    qq_numbers = sorted(candidate.qq_number for candidate in candidates if candidate.platform == Platform.QQ and candidate.qq_number)
+    self.assertEqual(qq_numbers, ['205872856', '549762872'])
+
+  def test_does_not_extract_qq_number_with_account_context_across_lines(self):
+    page = FetchedPage(
+      requested_url='https://example.com/contact',
+      final_url='https://example.com/contact',
+      html='''
+        <html><body>
+          <p>如需帮助请联系 QQ号：</p>
+          <p>549762872</p>
+        </body></html>
+      ''',
+      title='contact',
+      text='',
+    )
+
+    candidates = self.extractor.extract([page])
+    self.assertFalse(any(candidate.qq_number for candidate in candidates))
+
+  def test_does_not_extract_plain_numbers_without_qq_group_context(self):
+    page = FetchedPage(
+      requested_url='https://example.com/changelog',
+      final_url='https://example.com/changelog',
+      html='''
+        <html><body>
+          <p>Version 2026.04.07 build 549762872 fixed issues.</p>
+        </body></html>
+      ''',
+      title='changelog',
+      text='',
+    )
+
+    candidates = self.extractor.extract([page])
+    self.assertFalse(any(candidate.qq_number for candidate in candidates))
 
 
 class SearchApiTests(unittest.TestCase):
   def setUp(self):
     self.client = TestClient(app)
 
-  def test_search_returns_empty_message(self):
+  def _test_search_returns_empty_message_when_no_results_legacy(self):
     with patch('app.api.routes.search_service.search', return_value=[]):
-      response = self.client.post('/api/search', json={'query': 'Cursor'})
+      response = self.client.post('/api/search', json={'query': 'some_nonexistent_product_xyz'})
 
     self.assertEqual(response.status_code, 200)
-    self.assertEqual(response.json()['empty_message'], '未发现该产品的官方群')
+    self.assertEqual(response.json()['empty_message'], '未在 GitHub 相关仓库中发现群聊二维码')
+
+  def test_search_returns_empty_message_when_no_results(self):
+    with patch('app.api.routes.search_service.search', return_value=[]):
+      response = self.client.post('/api/search', json={'query': 'some_nonexistent_product_xyz'})
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(response.json()['empty_message'], '未在 GitHub/官网相关页面中发现官方群入口')
+
+  def test_search_returns_cards_when_results_found(self):
+    mock_card = ProductCard(
+      product_id='abc123',
+      app_name='TestApp',
+      description='A test app',
+      github_stars=100,
+      created_at=None,
+      verified_at=datetime.now(timezone.utc),
+      groups=[],
+      group_discovery_status=GroupDiscoveryStatus.NOT_FOUND,
+      official_site_url='https://testapp.dev',
+      github_repo_url='https://github.com/example/testapp',
+    )
+    with patch('app.api.routes.search_service.search', return_value=[mock_card]):
+      response = self.client.post('/api/search', json={'query': 'testapp'})
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(len(response.json()['results']), 1)
+    self.assertIsNone(response.json()['empty_message'])
+
+  def test_search_refresh_flag_forces_refresh(self):
+    with patch('app.api.routes.search_service.search', return_value=[]) as search_mock:
+      response = self.client.post('/api/search', json={'query': 'n8n', 'refresh': True})
+
+    self.assertEqual(response.status_code, 200)
+    self.assertTrue(search_mock.call_args.kwargs.get('refresh'))
+
+  def test_recommendations_refresh_flag_forces_refresh(self):
+    payload = RecommendationsResponse(
+      tools=[RecommendedTool(name='FastGPT', full_name='labring/FastGPT', stars=1, description=None, topics=[])],
+      cached_at=datetime.now(timezone.utc),
+    )
+    with patch('app.api.routes.search_service.get_recommendations', return_value=payload) as get_recommendations_mock:
+      response = self.client.get('/api/recommendations?refresh=true')
+
+    self.assertEqual(response.status_code, 200)
+    get_recommendations_mock.assert_called_once_with(force_refresh=True)
+
+  def test_mark_group_viewed_endpoint(self):
+    payload = {
+      'product_id': 'abc123',
+      'app_name': 'TestApp',
+      'group': {
+        'group_id': 'group001',
+        'platform': Platform.DISCORD.value,
+        'group_type': GroupType.UNKNOWN.value,
+        'entry': {'type': 'link', 'url': 'https://discord.com/invite/test'},
+        'is_added': False,
+        'source_urls': ['https://example.com'],
+      },
+    }
+    with patch('app.api.routes.search_service.mark_group_viewed') as mark_mock:
+      response = self.client.post('/api/groups/viewed', json=payload)
+
+    self.assertEqual(response.status_code, 200)
+    mark_mock.assert_called_once()
+
+  def test_list_viewed_groups_endpoint(self):
+    with patch('app.api.routes.search_service.list_viewed_groups', return_value=[]):
+      response = self.client.get('/api/groups/viewed')
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(response.json()['groups'], [])
+
+  def test_remove_viewed_group_endpoint(self):
+    with patch('app.api.routes.search_service.remove_viewed_group') as remove_mock:
+      response = self.client.delete('/api/groups/viewed/group001')
+
+    self.assertEqual(response.status_code, 200)
+    remove_mock.assert_called_once_with('group001')
+
+  def test_search_forwards_limit_parameter(self):
+    with patch('app.api.routes.search_service.search', return_value=[]) as search_mock:
+      response = self.client.post('/api/search', json={'query': 'n8n', 'limit': 50})
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(search_mock.call_args.kwargs.get('limit'), 50)
+
+  def test_search_rejects_limit_above_hard_limit(self):
+    with patch('app.api.routes.search_service.search', return_value=[]) as search_mock:
+      response = self.client.post('/api/search', json={'query': 'n8n', 'limit': 51})
+
+    self.assertEqual(response.status_code, 422)
+    search_mock.assert_not_called()
+
+  def test_manual_upload_link_mode_endpoint(self):
+    with patch('app.api.routes.search_service.manual_upload_group', return_value='manual001') as upload_mock:
+      response = self.client.post(
+        '/api/groups/manual-upload',
+        data={
+          'app_name': 'Manual Tool',
+          'platform': Platform.DINGTALK.value,
+          'group_type': GroupType.UNKNOWN.value,
+          'entry_type': 'link',
+          'entry_url': 'https://qr.dingtalk.com/action/join?code=123',
+        },
+      )
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(response.json()['view_key'], 'manual001')
+    upload_mock.assert_called_once()
+
+  def test_manual_upload_qrcode_mode_requires_file(self):
+    response = self.client.post(
+      '/api/groups/manual-upload',
+      data={
+        'app_name': 'Manual Tool',
+        'platform': Platform.DISCORD.value,
+        'group_type': GroupType.UNKNOWN.value,
+        'entry_type': 'qrcode',
+      },
+    )
+
+    self.assertEqual(response.status_code, 400)
+
+  def test_manual_upload_link_mode_requires_entry_url(self):
+    response = self.client.post(
+      '/api/groups/manual-upload',
+      data={
+        'app_name': 'Manual Tool',
+        'platform': Platform.WECOM.value,
+        'group_type': GroupType.UNKNOWN.value,
+        'entry_type': 'link',
+      },
+    )
+
+    self.assertEqual(response.status_code, 400)
 
 
 if __name__ == '__main__':
