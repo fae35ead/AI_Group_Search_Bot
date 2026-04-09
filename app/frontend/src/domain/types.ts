@@ -79,6 +79,7 @@ export interface ViewedGroup {
   groupType: GroupType
   entry: GroupEntry
   viewedAt: string
+  isJoined: boolean
 }
 
 export type ManualEntryType = 'qrcode' | 'link'

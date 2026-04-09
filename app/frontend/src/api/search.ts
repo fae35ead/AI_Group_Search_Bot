@@ -81,6 +81,7 @@ interface ViewedGroupDto {
   group_type: GroupType
   entry: GroupEntryDto
   viewed_at: string
+  is_joined: boolean
 }
 
 interface ViewedGroupsResponseDto {
@@ -205,6 +206,7 @@ export async function fetchViewedGroups(): Promise<ViewedGroup[]> {
     groupType: group.group_type,
     entry: mapEntry(group.entry),
     viewedAt: group.viewed_at,
+    isJoined: group.is_joined ?? false,
   }))
 }
 
@@ -244,6 +246,45 @@ export async function removeViewedGroup(viewKey: string): Promise<void> {
   })
   if (!response.ok) {
     throw new Error(`Remove viewed failed with status ${response.status}`)
+  }
+}
+
+export async function toggleGroupJoined(viewKey: string): Promise<{ isJoined: boolean }> {
+  const response = await fetch(`/api/groups/viewed/${encodeURIComponent(viewKey)}/joined`, {
+    method: 'PATCH',
+    headers: { Accept: 'application/json' },
+  })
+  if (!response.ok) {
+    throw new Error(`Toggle joined failed with status ${response.status}`)
+  }
+  const payload = (await response.json()) as { ok: true; is_joined: boolean }
+  return { isJoined: payload.is_joined }
+}
+
+export async function bulkMarkGroupsViewed(
+  items: Array<{ card: ProductCard; group: OfficialGroup }>,
+): Promise<void> {
+  const requestPayload = {
+    items: items.map(({ card, group }) => ({
+      product_id: card.productId,
+      app_name: card.appName,
+      group: {
+        group_id: group.groupId,
+        platform: group.platform,
+        group_type: group.groupType,
+        entry: mapEntryToDto(group.entry),
+        is_added: group.isAdded,
+        source_urls: group.sourceUrls,
+      },
+    })),
+  }
+  const response = await fetch('/api/groups/viewed/bulk', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(requestPayload),
+  })
+  if (!response.ok) {
+    throw new Error(`Bulk mark viewed failed with status ${response.status}`)
   }
 }
 

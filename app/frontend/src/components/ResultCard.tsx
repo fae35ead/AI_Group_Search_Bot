@@ -130,7 +130,7 @@ export function ResultCard({
           onClick={() => void onMarkViewed(card, primaryGroup)}
           type="button"
         >
-          {isPrimaryMarking ? '处理中…' : '标记主入口已查看'}
+          {isPrimaryMarking ? '处理中…' : '入库'}
         </button>
         <div className="action-column action-column-right">
           {secondaryGroups.length > 0 ? (
@@ -192,7 +192,7 @@ export function ResultCard({
                         onClick={() => void onMarkViewed(card, group)}
                         type="button"
                       >
-                        {isMarking ? '处理中…' : '标记已查看'}
+                        {isMarking ? '处理中…' : '入库'}
                       </button>
 
                       <div className="action-column action-column-right">

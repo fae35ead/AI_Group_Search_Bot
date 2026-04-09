@@ -5,6 +5,8 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from app.api.schemas import (
+  BulkMarkViewedRequest,
+  BulkMarkViewedResponse,
   GroupType,
   HealthResponse,
   MarkViewedGroupRequest,
@@ -15,6 +17,7 @@ from app.api.schemas import (
   RecommendationsResponse,
   SearchRequest,
   SearchResponse,
+  ToggleJoinedResponse,
   ViewedGroupsResponse,
 )
 from app.core.config import get_settings
@@ -76,6 +79,18 @@ def mark_group_viewed(payload: MarkViewedGroupRequest) -> MarkViewedGroupRespons
     group=payload.group,
   )
   return MarkViewedGroupResponse(ok=True)
+
+
+@router.post('/groups/viewed/bulk', response_model=BulkMarkViewedResponse)
+def bulk_mark_viewed(payload: BulkMarkViewedRequest) -> BulkMarkViewedResponse:
+  count = search_service.bulk_mark_viewed(payload.items)
+  return BulkMarkViewedResponse(ok=True, count=count)
+
+
+@router.patch('/groups/viewed/{view_key}/joined', response_model=ToggleJoinedResponse)
+def toggle_group_joined(view_key: str) -> ToggleJoinedResponse:
+  is_joined = search_service.toggle_group_joined(view_key)
+  return ToggleJoinedResponse(ok=True, is_joined=is_joined)
 
 
 @router.post('/groups/manual-upload', response_model=ManualUploadResponse)

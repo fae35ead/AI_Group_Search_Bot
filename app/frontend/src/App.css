@@ -1211,6 +1211,241 @@
   }
 }
 
+/* ── ViewedLibrary ────────────────────────────────────────────── */
+
+.lib-root {
+  display: grid;
+  gap: 12px;
+}
+
+.lib-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.lib-search-input {
+  flex: 1 1 160px;
+  min-width: 120px;
+  max-width: 260px;
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid rgba(60, 74, 64, 0.2);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.88);
+  color: var(--heading);
+  font: inherit;
+  font-size: 0.84rem;
+}
+
+.lib-search-input:focus-visible {
+  outline: 3px solid rgba(77, 124, 94, 0.24);
+  outline-offset: 2px;
+}
+
+.lib-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.lib-status-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.lib-result-count {
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.lib-list {
+  display: grid;
+  gap: 10px;
+}
+
+.lib-card {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  border: 1px solid rgba(60, 74, 64, 0.1);
+  border-radius: 18px;
+  background: rgba(249, 246, 240, 0.84);
+}
+
+.lib-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.lib-card-app {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--heading);
+}
+
+.lib-card-body {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.lib-card-entry {
+  flex-shrink: 0;
+}
+
+.lib-card-entry-text {
+  font-size: 0.84rem;
+  color: var(--muted);
+}
+
+.lib-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-left: auto;
+}
+
+.lib-card-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(60, 74, 64, 0.08);
+}
+
+.lib-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding-top: 4px;
+}
+
+.lib-pagination-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: 0 14px;
+  border: 1px solid rgba(60, 74, 64, 0.16);
+  border-radius: 999px;
+  background: rgba(248, 244, 237, 0.92);
+  color: var(--heading);
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition:
+    transform 180ms var(--ease-out-quart),
+    background-color 180ms var(--ease-out-quart),
+    border-color 180ms var(--ease-out-quart),
+    opacity 180ms var(--ease-out-quart);
+}
+
+.lib-pagination-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+  transform: none;
+}
+
+.lib-pagination-btn:focus-visible {
+  outline: 3px solid rgba(77, 124, 94, 0.24);
+  outline-offset: 2px;
+}
+
+.lib-page-indicator {
+  min-width: 80px;
+  text-align: center;
+}
+
+.lib-joined-btn {
+  min-height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(60, 74, 64, 0.2);
+  background: rgba(237, 233, 226, 0.94);
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.74rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition:
+    background-color 180ms var(--ease-out-quart),
+    color 180ms var(--ease-out-quart),
+    border-color 180ms var(--ease-out-quart),
+    opacity 180ms var(--ease-out-quart);
+}
+
+.lib-joined-btn.is-joined {
+  background: rgba(220, 237, 225, 0.92);
+  color: #1f5f3c;
+  border-color: rgba(57, 105, 74, 0.2);
+}
+
+.lib-joined-btn:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.lib-joined-btn:focus-visible {
+  outline: 3px solid rgba(77, 124, 94, 0.24);
+  outline-offset: 2px;
+}
+
+/* ── Auto Search Banner ──────────────────────────────────────── */
+
+.auto-decision-banner {
+  display: grid;
+  gap: 10px;
+  padding: 14px 18px;
+  border: 1px solid rgba(46, 99, 67, 0.24);
+  border-radius: 18px;
+  background: linear-gradient(135deg, rgba(220, 237, 225, 0.7), rgba(240, 248, 242, 0.9));
+}
+
+.auto-banner-text {
+  font-size: 0.88rem;
+  color: var(--heading);
+  font-weight: 600;
+  margin: 0;
+}
+
+.auto-banner-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 900px) {
+  .lib-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .lib-search-input {
+    max-width: 100%;
+  }
+
+  .lib-result-count {
+    margin-left: 0;
+  }
+
+  .lib-pagination-btn {
+    width: 100%;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .section-intro,
   .skeleton-line,
@@ -1230,7 +1465,9 @@
   .viewed-toggle,
   .recommendation-tag,
   .result-card,
-  .collapsible {
+  .collapsible,
+  .lib-pagination-btn,
+  .lib-joined-btn {
     transition-duration: 0.01ms !important;
   }
 }

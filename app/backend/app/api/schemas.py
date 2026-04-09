@@ -125,10 +125,25 @@ class ViewedGroupItem(BaseModel):
   group_type: GroupType
   entry: GroupEntry
   viewed_at: datetime
+  is_joined: bool = False
 
 
 class ViewedGroupsResponse(BaseModel):
   groups: list[ViewedGroupItem]
+
+
+class ToggleJoinedResponse(BaseModel):
+  ok: Literal[True]
+  is_joined: bool
+
+
+class BulkMarkViewedRequest(BaseModel):
+  items: list[MarkViewedGroupRequest]
+
+
+class BulkMarkViewedResponse(BaseModel):
+  ok: Literal[True]
+  count: int
 
 
 class RecommendedTool(BaseModel):

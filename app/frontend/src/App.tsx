@@ -1,9 +1,9 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { fetchHealth, type HealthPayload } from './api/health'
-import { fetchRecommendations, fetchViewedGroups, manualUploadGroup, markGroupViewed, removeViewedGroup, searchOfficialGroups } from './api/search'
+import { bulkMarkGroupsViewed, fetchRecommendations, fetchViewedGroups, manualUploadGroup, markGroupViewed, removeViewedGroup, searchOfficialGroups, toggleGroupJoined } from './api/search'
 import { ResultCard } from './components/ResultCard'
-import { isUnknownGroupType } from './domain/groupDisplay'
+import { ViewedLibrary } from './components/ViewedLibrary'
 import { canonicalizePlatform } from './domain/platform'
 import type { GroupType, ManualEntryType, OfficialGroup, Platform, ProductCard, RecommendedTool, SearchFilters, ViewedGroup } from './domain/types'
 import './App.css'
@@ -66,6 +66,7 @@ function readViewedGroupsFromStorage(): ViewedGroup[] {
       .map((item) => ({
         ...item,
         platform: canonicalizePlatform(item.platform as Platform | '企业微信'),
+        isJoined: item.isJoined ?? false,
       }))
   } catch {
     return []
@@ -123,8 +124,6 @@ const GROUP_TYPE_OPTIONS: Array<{ label: string; value: GroupType }> = [
   { label: '招募/内测群', value: '\u62db\u52df/\u5185\u6d4b\u7fa4' },
 ]
 
-const PLATFORM_DISPLAY_ORDER: Platform[] = ['\u5fae\u4fe1', 'QQ', '\u9489\u9489', '\u98de\u4e66', 'Discord', '\u4f01\u4e1a\u5fae\u4fe1']
-
 const INITIAL_MANUAL_FORM: ManualUploadFormState = {
   appName: '',
   description: '',
@@ -157,9 +156,13 @@ function App() {
   const [viewedExpanded, setViewedExpanded] = useState(false)
   const [markingGroupIds, setMarkingGroupIds] = useState<string[]>([])
   const [removingViewedKeys, setRemovingViewedKeys] = useState<string[]>([])
-  const [expandedViewedApps, setExpandedViewedApps] = useState<string[]>([])
+  const [togglingJoinedKeys, setTogglingJoinedKeys] = useState<string[]>([])
   const [expandedResultCards, setExpandedResultCards] = useState<string[]>([])
   const [loadingViewed, setLoadingViewed] = useState(false)
+  const [autoMode, setAutoMode] = useState(false)
+  const [autoQueue, setAutoQueue] = useState<string[]>([])
+  const [autoPending, setAutoPending] = useState<ProductCard[] | null>(null)
+  const autoModeRef = useRef(false)
   const [manualUploadOpen, setManualUploadOpen] = useState(false)
   const [manualUploading, setManualUploading] = useState(false)
   const [manualUploadError, setManualUploadError] = useState<string | null>(null)
@@ -213,37 +216,6 @@ function App() {
     }
     return filtered.slice(0, resultLimit)
   }, [rawResults, minStars, createdAfter, createdBefore, selectedGroupPlatforms, resultLimit])
-
-  const viewedGroupsByApp = useMemo(() => {
-    const buckets = new Map<string, { key: string; productId: string; appName: string; groups: ViewedGroup[] }>()
-    for (const group of viewedGroups) {
-      const key = `${group.productId}:${group.appName}`
-      const existing = buckets.get(key)
-      if (existing) {
-        existing.groups.push(group)
-      } else {
-        buckets.set(key, {
-          key,
-          productId: group.productId,
-          appName: group.appName,
-          groups: [group],
-        })
-      }
-    }
-
-    return Array.from(buckets.values())
-      .map((item) => {
-        item.groups.sort((a, b) => +new Date(b.viewedAt) - +new Date(a.viewedAt))
-        const platforms = Array.from(new Set(item.groups.map((group) => group.platform))).sort(
-          (left, right) => PLATFORM_DISPLAY_ORDER.indexOf(left) - PLATFORM_DISPLAY_ORDER.indexOf(right),
-        )
-        return {
-          ...item,
-          platforms,
-        }
-      })
-      .sort((a, b) => a.appName.localeCompare(b.appName, 'zh-CN'))
-  }, [viewedGroups])
 
   const hasSearchContext = loading || rawResults.length > 0 || Boolean(emptyMessage) || Boolean(searchError)
 
@@ -369,10 +341,6 @@ function App() {
   }, [])
 
   useEffect(() => {
-    setExpandedViewedApps((prev) => prev.filter((key) => viewedGroupsByApp.some((item) => item.key === key)))
-  }, [viewedGroupsByApp])
-
-  useEffect(() => {
     setExpandedResultCards((prev) => prev.filter((id) => displayedResults.some((item) => item.productId === id)))
   }, [displayedResults])
 
@@ -467,8 +435,6 @@ function App() {
           .filter((item) => item.groups.length > 0),
       )
       setViewedExpanded(true)
-      const appKey = `${card.productId}:${card.appName}`
-      setExpandedViewedApps((prev) => (prev.includes(appKey) ? prev : [...prev, appKey]))
       await loadViewedList()
     } catch {
       // Keep current UI on mark failure.
@@ -491,6 +457,108 @@ function App() {
     } finally {
       setRemovingViewedKeys((prev) => prev.filter((id) => id !== viewKey))
     }
+  }
+
+  async function handleToggleJoined(viewKey: string) {
+    if (togglingJoinedKeys.includes(viewKey)) {
+      return
+    }
+    setTogglingJoinedKeys((prev) => [...prev, viewKey])
+    try {
+      const { isJoined } = await toggleGroupJoined(viewKey)
+      const updated = viewedGroups.map((g) => (g.viewKey === viewKey ? { ...g, isJoined } : g))
+      setViewedGroups(updated)
+      persistViewedGroupsToStorage(updated)
+    } catch {
+      // Keep current UI on toggle failure.
+    } finally {
+      setTogglingJoinedKeys((prev) => prev.filter((k) => k !== viewKey))
+    }
+  }
+
+  async function startAutoMode() {
+    const keywords = recommendations.map((r) => r.name).filter(Boolean)
+    if (keywords.length === 0) {
+      return
+    }
+    const shuffled = [...keywords].sort(() => Math.random() - 0.5)
+    autoModeRef.current = true
+    setAutoMode(true)
+    setAutoPending(null)
+    await runAutoRound(shuffled, 0)
+  }
+
+  function stopAutoMode() {
+    autoModeRef.current = false
+    setAutoMode(false)
+    setAutoPending(null)
+    setAutoQueue([])
+    setSearchMode(null)
+  }
+
+  async function runAutoRound(queue: string[], index: number) {
+    if (!autoModeRef.current || index >= queue.length) {
+      setAutoMode(false)
+      autoModeRef.current = false
+      setAutoQueue([])
+      setSearchMode(null)
+      return
+    }
+    const keyword = queue[index]
+    const remaining = queue.slice(index + 1)
+    setAutoQueue(remaining)
+    setSearchMode('initial')
+    setQuery(keyword)
+    setSubmittedQuery(keyword)
+
+    let results: ProductCard[] = []
+    try {
+      const response = await searchOfficialGroups(keyword, buildFilters(), { limit: resultLimit })
+      results = Array.from(new Map(response.results.map((card) => [card.productId, card])).values())
+      setRawResults(results)
+      setEmptyMessage(response.emptyMessage)
+    } catch {
+      // Skip to next keyword on error.
+      setSearchMode(null)
+      if (autoModeRef.current) {
+        await runAutoRound(remaining, 0)
+      }
+      return
+    }
+
+    setSearchMode(null)
+    if (!autoModeRef.current) {
+      return
+    }
+
+    setAutoPending(results)
+  }
+
+  async function handleAutoAcceptAll() {
+    if (!autoPending) {
+      return
+    }
+    const allGroups = autoPending.flatMap((card) =>
+      card.groups.map((group) => ({ card, group })),
+    )
+    setAutoPending(null)
+    try {
+      await bulkMarkGroupsViewed(allGroups)
+      await loadViewedList()
+      setViewedExpanded(true)
+    } catch {
+      // Continue even if bulk fails.
+    }
+
+    if (autoModeRef.current) {
+      await runAutoRound(autoQueue, 0)
+    }
+  }
+
+  function handleAutoPause() {
+    autoModeRef.current = false
+    setAutoMode(false)
+    setAutoPending(null)
   }
 
   function resetManualForm() {
@@ -589,20 +657,6 @@ function App() {
     } finally {
       setManualUploading(false)
     }
-  }
-
-  function toggleViewedApp(appKey: string) {
-    setExpandedViewedApps((prev) => (prev.includes(appKey) ? prev.filter((id) => id !== appKey) : [...prev, appKey]))
-  }
-
-  function describeViewedEntry(group: ViewedGroup) {
-    if (group.entry.type === 'qrcode') {
-      return group.entry.fallbackUrl ? '二维码入口，可直接打开链接' : '二维码入口，支持扫码加入'
-    }
-    if (group.entry.type === 'qq_number') {
-      return `QQ群号：${'qqNumber' in group.entry ? group.entry.qqNumber : ''}`
-    }
-    return group.entry.note
   }
 
   function toggleResultCard(productId: string) {
@@ -789,6 +843,19 @@ function App() {
                 >
                   {manualUploadOpen ? '收起手动上传' : '手动上传'}
                 </button>
+                <button
+                  className="manual-upload-toggle utility-trigger"
+                  disabled={autoMode || loading || recommendations.length === 0}
+                  onClick={() => void startAutoMode()}
+                  type="button"
+                >
+                  {autoMode ? `自动搜索中（剩余 ${autoQueue.length} 词）` : '全自动代理模式'}
+                </button>
+                {autoMode ? (
+                  <button className="manual-upload-toggle" onClick={stopAutoMode} type="button">
+                    停止
+                  </button>
+                ) : null}
                 <p className="search-helper-copy">
                   {'支持：AI 工具名 / 关键词 / 官网域名 / GitHub 仓库。结果：可调返回数量（3-50），筛选即时生效。'}
                 </p>
@@ -947,7 +1014,7 @@ function App() {
 
         <section className="panel viewed-panel utility-panel section-intro" style={{ '--i': 3 } as React.CSSProperties}>
           <div className="viewed-header">
-            <p className="viewed-title">已查看列表</p>
+            <p className="viewed-title">入库列表</p>
             <button aria-expanded={viewedExpanded} className="viewed-toggle" onClick={() => setViewedExpanded((prev) => !prev)} type="button">
               {viewedExpanded ? '收起' : `展开 (${viewedGroups.length})`}
             </button>
@@ -956,119 +1023,49 @@ function App() {
           {viewedExpanded ? (
             loadingViewed ? (
               <p className="status-note">{'加载中...'}</p>
-            ) : viewedGroupsByApp.length > 0 ? (
-              <div className="viewed-app-list">
-                {viewedGroupsByApp.map((appItem) => {
-                  const expanded = expandedViewedApps.includes(appItem.key)
-                  return (
-                    <article className={`viewed-app-item${expanded ? ' expanded' : ''}`} key={appItem.key}>
-                      <button
-                        aria-controls={`viewed-app-panel-${appItem.key}`}
-                        aria-expanded={expanded}
-                        className="viewed-app-summary"
-                        onClick={() => toggleViewedApp(appItem.key)}
-                        type="button"
-                      >
-                        <div className="viewed-app-summary-main">
-                          <p className="viewed-app">{appItem.appName}</p>
-                          <div className="viewed-app-meta">
-                            <span className="viewed-count">{`${appItem.groups.length} 个群聊`}</span>
-                            <div className="group-tags viewed-platform-tags" aria-label={`${appItem.appName} 平台`}>
-                              {appItem.platforms.map((platform) => (
-                                <span className="tag muted" key={platform}>
-                                  {platform}
-                                </span>
-                              ))}
-                            </div>
-                          </div>
-                        </div>
-                        <span className="viewed-summary-action">{expanded ? '收起明细' : '展开明细'}</span>
-                      </button>
-
-                      {expanded ? (
-                        <div className="viewed-group-list" id={`viewed-app-panel-${appItem.key}`}>
-                          {appItem.groups.map((group) => (
-                            <article className="viewed-group-row" key={group.viewKey}>
-                              <div className="viewed-group-main">
-                                <div className="viewed-group-head">
-                                  <div className="group-tags">
-                                    <span className="tag">{group.platform}</span>
-                                    {!isUnknownGroupType(group.groupType) ? (
-                                      <span className="tag muted">{group.groupType}</span>
-                                    ) : null}
-                                  </div>
-                                  <span className="viewed-entry-type">
-                                    {group.entry.type === 'qrcode'
-                                      ? '二维码'
-                                      : group.entry.type === 'qq_number'
-                                        ? 'QQ群号'
-                                        : '链接'}
-                                  </span>
-                                </div>
-
-                                <div className="viewed-entry-preview">
-                                  {group.entry.type === 'qrcode' ? (
-                                    <img
-                                      alt={`${group.appName} ${group.platform} 二维码`}
-                                      className="viewed-entry-thumb"
-                                      decoding="async"
-                                      loading="lazy"
-                                      src={group.entry.imagePath}
-                                    />
-                                  ) : null}
-                                  <p className="viewed-entry-summary">{describeViewedEntry(group)}</p>
-                                </div>
-                              </div>
-
-                              <div className="viewed-group-actions">
-                                {group.entry.type === 'qrcode' ? (
-                                  group.entry.fallbackUrl ? (
-                                    <a className="source-link compact-link" href={group.entry.fallbackUrl} rel="noreferrer" target="_blank">
-                                      {'打开入口'}
-                                    </a>
-                                  ) : null
-                                ) : group.entry.type === 'qq_number' ? (
-                                  <button
-                                    className="source-link compact-link"
-                                    onClick={() => void handleCopyQQNumber('qqNumber' in group.entry ? group.entry.qqNumber : '')}
-                                    type="button"
-                                  >
-                                    {'复制群号'}
-                                  </button>
-                                ) : (
-                                  <a className="source-link compact-link" href={group.entry.url} rel="noreferrer" target="_blank">
-                                    {'打开入口'}
-                                  </a>
-                                )}
-                                <button
-                                  className="source-link viewed-remove compact-link"
-                                  disabled={removingViewedKeys.includes(group.viewKey)}
-                                  onClick={() => void handleRemoveViewed(group.viewKey)}
-                                  type="button"
-                                >
-                                  {removingViewedKeys.includes(group.viewKey) ? '移除中...' : '移除列表'}
-                                </button>
-                              </div>
-                            </article>
-                          ))}
-                        </div>
-                      ) : null}
-                    </article>
-                  )
-                })}
-              </div>
             ) : (
-              <p className="status-note">{'暂无已查看群聊。'}</p>
+              <ViewedLibrary
+                groups={viewedGroups}
+                removingKeys={removingViewedKeys}
+                togglingJoinedKeys={togglingJoinedKeys}
+                onRemove={(viewKey) => void handleRemoveViewed(viewKey)}
+                onToggleJoined={(viewKey) => void handleToggleJoined(viewKey)}
+                onCopyQQNumber={(qqNumber) => void handleCopyQQNumber(qqNumber)}
+              />
             )
           ) : null}
         </section>
 
         <section className="results-section section-intro" style={{ '--i': 4 } as React.CSSProperties}>
+          {autoPending !== null && autoMode ? (
+            <div className="auto-decision-banner">
+              <p className="auto-banner-text">
+                {`自动搜索完成：找到 ${autoPending.length} 个产品，共 ${autoPending.reduce((n, c) => n + c.groups.length, 0)} 个群聊入口`}
+              </p>
+              <div className="auto-banner-actions">
+                <button
+                  className="action-button primary"
+                  onClick={() => void handleAutoAcceptAll()}
+                  type="button"
+                >
+                  全部入库
+                </button>
+                <button
+                  className="action-button secondary"
+                  onClick={handleAutoPause}
+                  type="button"
+                >
+                  手动选择（暂停）
+                </button>
+              </div>
+            </div>
+          ) : null}
+
           {!showInitialSkeleton && displayedResults.length > 0 ? (
             <div className="results-overview" aria-live="polite">
               <div>
                 <p className="results-eyebrow">搜索结果</p>
-                <h2>{query.trim() ? `“${query.trim()}” 的群聊入口` : '搜索结果'}</h2>
+                <h2>{query.trim() ? `”${query.trim()}” 的群聊入口` : '搜索结果'}</h2>
               </div>
               <div className="results-meta">
                 <span>{displayedResults.length} 个结果</span>

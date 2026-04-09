@@ -1876,7 +1876,8 @@ class SearchService:
             entry_url,
             image_path,
             fallback_url,
-            viewed_at
+            viewed_at,
+            is_joined
           FROM viewed_groups
           ORDER BY viewed_at DESC
           ''',
@@ -1942,6 +1943,7 @@ class SearchService:
           group_type=group_type,
           entry=entry,
           viewed_at=viewed_at,
+          is_joined=bool(row['is_joined']),
         ),
       )
 
@@ -1950,6 +1952,40 @@ class SearchService:
     if normalized_image_updates or canonical_platform_updates:
       self._sync_viewed_exports_safely()
     return items
+
+  def toggle_group_joined(self, view_key: str) -> bool:
+    if not view_key:
+      return False
+    try:
+      with get_connection(self.settings.database_path) as connection:
+        connection.execute(
+          'UPDATE viewed_groups SET is_joined = 1 - is_joined WHERE view_key = ?',
+          (view_key,),
+        )
+        connection.commit()
+        row = connection.execute(
+          'SELECT is_joined FROM viewed_groups WHERE view_key = ?',
+          (view_key,),
+        ).fetchone()
+        return bool(row['is_joined']) if row else False
+    except Exception as exc:
+      logger.warning('Failed to toggle group joined: %s', exc)
+      return False
+
+  def bulk_mark_viewed(self, items: list) -> int:
+    """Mark multiple groups as viewed. Calls mark_group_viewed for each item."""
+    count = 0
+    for item in items:
+      try:
+        self.mark_group_viewed(
+          product_id=item.product_id,
+          app_name=item.app_name,
+          group=item.group,
+        )
+        count += 1
+      except Exception as exc:
+        logger.warning('Failed to bulk mark viewed item: %s', exc)
+    return count
 
   # -------------------------------------------------------------------------
   # Page fetching
