@@ -57,6 +57,10 @@ GITHUB_VARIANT_MAX_WORKERS = 4
 GITHUB_SEARCH_TIMEOUT = 10.0
 PAGE_FETCH_TIMEOUT = 8.0
 WEB_SEARCH_TIMEOUT = 8.0
+MAX_OFFICIAL_BROWSER_FALLBACK_CANDIDATES = 3
+MAX_WEB_OFFICIAL_BROWSER_FALLBACK_CANDIDATES = 2
+BROWSER_FETCH_TIMEOUT_MS = 20_000
+BROWSER_WAIT_AFTER_LOAD_MS = 1_500
 SEARCH_CACHE_TTL_SECONDS = 24 * 60 * 60
 CJK_PATTERN = re.compile(r'[\u3400-\u9fff]')
 MAX_GITHUB_SEARCH_PER_PAGE = 50
@@ -287,6 +291,10 @@ class SearchService:
       for candidate in fallback_candidates
       if self._candidate_key(candidate) not in existing_keys
     ]
+    filtered_fallback.sort(
+      key=lambda candidate: self._web_fallback_candidate_sort_key(normalized_query, candidate),
+      reverse=True,
+    )
 
     merged_candidates = crawl_candidates + filtered_fallback
     self._debug_log(
@@ -340,6 +348,12 @@ class SearchService:
     global_seen_group_keys: set[str] = set()
     page_fetch_cache: dict[str, FetchedPage | None] = {}
     page_cache_lock = Lock()
+    official_browser_budget = MAX_OFFICIAL_BROWSER_FALLBACK_CANDIDATES
+    web_official_browser_budget = min(
+      MAX_WEB_OFFICIAL_BROWSER_FALLBACK_CANDIDATES,
+      official_browser_budget,
+    )
+    attempted_official_domains: set[str] = set()
     excluded = exclude_product_ids or set()
     filtered_candidates = [
       candidate for candidate in candidates if self._candidate_product_id(candidate) not in excluded
@@ -378,6 +392,41 @@ class SearchService:
         pages = pages_by_index[index]
 
         extracted = self.extractor.extract(pages) if pages else []
+        official_homepage_url = self._resolve_candidate_official_homepage(candidate)
+        official_homepage_host = self._host_key(official_homepage_url)
+        official_domain = self._domain_key(official_homepage_url)
+        is_web_candidate = candidate.repo_url is None
+        has_fallback_budget = (
+          official_browser_budget > 0
+          and (
+            (is_web_candidate and web_official_browser_budget > 0)
+            or (
+              not is_web_candidate
+              and (official_browser_budget - web_official_browser_budget) > 0
+            )
+          )
+        )
+        should_try_browser_fallback = (
+          has_fallback_budget
+          and official_homepage_host is not None
+          and official_domain is not None
+          and official_domain not in attempted_official_domains
+          and self._should_try_official_browser_fallback(
+            candidate=candidate,
+            pages=pages,
+            extracted=extracted,
+            official_homepage_host=official_homepage_host,
+          )
+        )
+        if should_try_browser_fallback and official_homepage_url:
+          attempted_official_domains.add(official_domain)
+          official_browser_budget -= 1
+          if is_web_candidate:
+            web_official_browser_budget -= 1
+          browser_page = self._fetch_page_with_browser(official_homepage_url)
+          if browser_page is not None:
+            extracted.extend(self.extractor.extract([browser_page]))
+
         supported_groups = self._dedupe_groups(extracted)
         unique_groups: list[ExtractedGroupCandidate] = []
         for group in supported_groups:
@@ -399,6 +448,92 @@ class SearchService:
         cards.append(card)
 
     return cards
+
+  def _resolve_candidate_official_homepage(self, candidate: GitHubRepositoryCandidate) -> str | None:
+    homepage = self._root_url(candidate.homepage) or candidate.homepage
+    if not homepage:
+      return None
+    parsed = urlparse(homepage)
+    if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
+      return None
+    host = parsed.netloc.lower().removeprefix('www.')
+    if host == 'github.com':
+      return None
+    return homepage
+
+  def _should_try_official_browser_fallback(
+    self,
+    *,
+    candidate: GitHubRepositoryCandidate,
+    pages: list[FetchedPage],
+    extracted: list[ExtractedGroupCandidate],
+    official_homepage_host: str,
+  ) -> bool:
+    del candidate
+    has_static_official_page = any(
+      page.fetch_method == 'http' and self._host_key(page.final_url) == official_homepage_host
+      for page in pages
+    )
+    if not has_static_official_page:
+      return False
+
+    has_official_group = any(
+      any(self._host_key(source_url) == official_homepage_host for source_url in (group.source_urls or [group.source_url]))
+      for group in extracted
+    )
+    return not has_official_group
+
+  def _host_key(self, url: str | None) -> str | None:
+    if not url:
+      return None
+
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().rstrip('.')
+    if not host:
+      return None
+    if host.startswith('www.'):
+      host = host[4:]
+    return host
+
+  def _domain_label(self, host: str | None) -> str:
+    if not host:
+      return ''
+    segments = host.split('.')
+    if not segments:
+      return ''
+    if len(segments) >= 2:
+      return segments[-2]
+    return segments[0]
+
+  def _web_fallback_candidate_sort_key(
+    self,
+    query: str,
+    candidate: GitHubRepositoryCandidate,
+  ) -> tuple[int, int]:
+    host = self._host_key(candidate.homepage)
+    if not host:
+      return (0, 0)
+
+    query_key = query.lower().strip()
+    domain_label = self._domain_label(host)
+    score = 0
+    if domain_label == query_key:
+      score += 310
+    elif domain_label.startswith(query_key):
+      score += 301
+    elif query_key in domain_label:
+      score += 220
+    elif query_key in host:
+      score += 160
+
+    if host.endswith('.com'):
+      score += 35
+    elif host.endswith('.cn'):
+      score += 25
+    elif host.endswith('.io'):
+      score += 15
+
+    return (score, -len(host))
 
   def _merge_product_cards(
     self,
@@ -1896,6 +2031,45 @@ class SearchService:
       title=title,
       text=soup.get_text(' ', strip=True)[:2000],
       fetch_method='http',
+      soup=soup,
+    )
+
+  def _fetch_page_with_browser(self, url: str) -> FetchedPage | None:
+    try:
+      from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+      from playwright.sync_api import sync_playwright
+    except Exception as exc:
+      logger.warning('Playwright is unavailable for %r: %s', url, exc)
+      return None
+
+    try:
+      with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page()
+        try:
+          page.goto(url, wait_until='domcontentloaded', timeout=BROWSER_FETCH_TIMEOUT_MS)
+          try:
+            page.wait_for_load_state('networkidle', timeout=BROWSER_FETCH_TIMEOUT_MS)
+          except PlaywrightTimeoutError:
+            pass
+          page.wait_for_timeout(BROWSER_WAIT_AFTER_LOAD_MS)
+          html = page.content()
+          final_url = page.url
+          title = page.title()
+        finally:
+          browser.close()
+    except Exception as exc:
+      logger.warning('Browser fetch failed for %r: %s', url, exc)
+      return None
+
+    soup = BeautifulSoup(html, 'html.parser')
+    return FetchedPage(
+      requested_url=url,
+      final_url=final_url,
+      html=html,
+      title=title,
+      text=soup.get_text(' ', strip=True)[:2000],
+      fetch_method='browser',
       soup=soup,
     )
 

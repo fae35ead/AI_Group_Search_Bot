@@ -965,6 +965,76 @@ class SearchServiceTests(unittest.TestCase):
     merged = collect_cards_mock.call_args.args[0]
     self.assertEqual([candidate.full_name for candidate in merged], ['org/minimax', 'web/minimax.com'])
 
+  def test_search_sorts_web_fallback_candidates_by_query_relevance(self):
+    fallback_candidates = [
+      GitHubRepositoryCandidate(
+        repo_url=None,
+        full_name='web/minimax.ad',
+        repo_name='minimax',
+        owner_name='minimax.ad',
+        owner_type='Website',
+        homepage='https://minimax.ad',
+        description='minimax ad',
+        stars=0,
+      ),
+      GitHubRepositoryCandidate(
+        repo_url=None,
+        full_name='web/www.minimax.io',
+        repo_name='minimax',
+        owner_name='www.minimax.io',
+        owner_type='Website',
+        homepage='https://www.minimax.io',
+        description='minimax io',
+        stars=0,
+      ),
+      GitHubRepositoryCandidate(
+        repo_url=None,
+        full_name='web/www.minimaxi.com',
+        repo_name='minimaxi',
+        owner_name='www.minimaxi.com',
+        owner_type='Website',
+        homepage='https://www.minimaxi.com',
+        description='minimaxi com',
+        stars=0,
+      ),
+      GitHubRepositoryCandidate(
+        repo_url=None,
+        full_name='web/www.minimax.com',
+        repo_name='minimax',
+        owner_name='www.minimax.com',
+        owner_type='Website',
+        homepage='https://www.minimax.com',
+        description='minimax com',
+        stars=0,
+      ),
+    ]
+
+    with patch.object(self.service, '_github_search', return_value=[]), patch.object(
+      self.service,
+      '_build_crawl_candidates',
+      return_value=[],
+    ), patch.object(
+      self.service,
+      '_build_web_fallback_candidates',
+      return_value=fallback_candidates,
+    ), patch.object(
+      self.service,
+      '_collect_cards',
+      return_value=[],
+    ) as collect_cards_mock:
+      self.service.search('minimax', refresh=True, limit=5)
+
+    merged = collect_cards_mock.call_args.args[0]
+    self.assertEqual(
+      [candidate.full_name for candidate in merged],
+      [
+        'web/www.minimax.com',
+        'web/www.minimaxi.com',
+        'web/www.minimax.io',
+        'web/minimax.ad',
+      ],
+    )
+
   def test_collect_cards_stops_after_first_batch_when_max_cards_reached(self):
     candidates = [
       GitHubRepositoryCandidate(
@@ -1287,6 +1357,252 @@ class SearchServiceTests(unittest.TestCase):
       cards = self.service._collect_cards(candidates)
 
     self.assertEqual([card.app_name for card in cards], ['slow', 'fast-a', 'fast-b'])
+
+  def test_collect_cards_uses_browser_fallback_when_official_groups_missing(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/repo',
+      full_name='example/repo',
+      repo_name='repo',
+      owner_name='example',
+      owner_type='Organization',
+      homepage='https://official.minimax.example',
+      description='repo',
+      stars=10,
+    )
+    static_pages = [
+      FetchedPage(
+        requested_url='https://github.com/example/repo',
+        final_url='https://github.com/example/repo',
+        html='<html></html>',
+        title='repo',
+        text='',
+      ),
+      FetchedPage(
+        requested_url='https://official.minimax.example',
+        final_url='https://official.minimax.example',
+        html='<html></html>',
+        title='official',
+        text='',
+      ),
+    ]
+    browser_page = FetchedPage(
+      requested_url='https://official.minimax.example',
+      final_url='https://official.minimax.example',
+      html='<html></html>',
+      title='official',
+      text='',
+      fetch_method='browser',
+    )
+    github_group = ExtractedGroupCandidate(
+      platform=Platform.DISCORD,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://github.com/example/repo',
+      context='discord community',
+      entry_url='https://discord.com/invite/example-repo',
+      fallback_url='https://discord.com/invite/example-repo',
+      source_urls=['https://github.com/example/repo'],
+    )
+    official_group = ExtractedGroupCandidate(
+      platform=Platform.WECOM,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://official.minimax.example',
+      context='wechat group',
+      entry_url='https://work.weixin.qq.com/gm/official',
+      fallback_url='https://work.weixin.qq.com/gm/official',
+      source_urls=['https://official.minimax.example'],
+    )
+
+    def fake_extract(input_pages: list[FetchedPage]):
+      if any(page.fetch_method == 'browser' for page in input_pages):
+        return [official_group]
+      return [github_group]
+
+    with patch.object(self.service, '_fetch_candidate_pages', return_value=static_pages), patch.object(
+      self.service,
+      '_fetch_page_with_browser',
+      return_value=browser_page,
+    ) as browser_fetch_mock, patch.object(
+      self.service.extractor,
+      'extract',
+      side_effect=fake_extract,
+    ):
+      cards = self.service._collect_cards([candidate], max_cards=1)
+
+    self.assertEqual(len(cards), 1)
+    browser_fetch_mock.assert_called_once_with('https://official.minimax.example')
+    source_domains = {
+      self.service._domain_key(source_url)
+      for group in cards[0].groups
+      for source_url in group.source_urls
+    }
+    self.assertIn('minimax.example', source_domains)
+
+  def test_collect_cards_skips_browser_fallback_when_official_group_found_in_static_pages(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/repo',
+      full_name='example/repo',
+      repo_name='repo',
+      owner_name='example',
+      owner_type='Organization',
+      homepage='https://official.minimax.example',
+      description='repo',
+      stars=10,
+    )
+    static_pages = [
+      FetchedPage(
+        requested_url='https://official.minimax.example',
+        final_url='https://official.minimax.example',
+        html='<html></html>',
+        title='official',
+        text='',
+      ),
+    ]
+    official_group = ExtractedGroupCandidate(
+      platform=Platform.WECOM,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://official.minimax.example',
+      context='wechat group',
+      entry_url='https://work.weixin.qq.com/gm/official',
+      fallback_url='https://work.weixin.qq.com/gm/official',
+      source_urls=['https://official.minimax.example'],
+    )
+
+    with patch.object(self.service, '_fetch_candidate_pages', return_value=static_pages), patch.object(
+      self.service,
+      '_fetch_page_with_browser',
+    ) as browser_fetch_mock, patch.object(
+      self.service.extractor,
+      'extract',
+      return_value=[official_group],
+    ):
+      cards = self.service._collect_cards([candidate], max_cards=1)
+
+    self.assertEqual(len(cards), 1)
+    browser_fetch_mock.assert_not_called()
+
+  def test_collect_cards_triggers_browser_fallback_when_static_groups_only_from_subdomain(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/repo',
+      full_name='example/repo',
+      repo_name='repo',
+      owner_name='example',
+      owner_type='Organization',
+      homepage='https://www.minimaxi.com',
+      description='repo',
+      stars=10,
+    )
+    static_pages = [
+      FetchedPage(
+        requested_url='https://www.minimaxi.com',
+        final_url='https://www.minimaxi.com',
+        html='<html></html>',
+        title='official',
+        text='',
+      ),
+      FetchedPage(
+        requested_url='https://platform.minimaxi.com/docs',
+        final_url='https://platform.minimaxi.com/docs',
+        html='<html></html>',
+        title='docs',
+        text='',
+      ),
+    ]
+    browser_page = FetchedPage(
+      requested_url='https://www.minimaxi.com',
+      final_url='https://www.minimaxi.com',
+      html='<html></html>',
+      title='official',
+      text='',
+      fetch_method='browser',
+    )
+    static_subdomain_group = ExtractedGroupCandidate(
+      platform=Platform.DISCORD,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://platform.minimaxi.com/docs',
+      context='discord community',
+      entry_url='https://discord.gg/minimax',
+      fallback_url='https://discord.gg/minimax',
+      source_urls=['https://platform.minimaxi.com/docs'],
+    )
+    browser_homepage_group = ExtractedGroupCandidate(
+      platform=Platform.WECOM,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://www.minimaxi.com',
+      context='wechat group',
+      entry_url='https://work.weixin.qq.com/gm/official',
+      fallback_url='https://work.weixin.qq.com/gm/official',
+      source_urls=['https://www.minimaxi.com'],
+    )
+
+    def fake_extract(input_pages: list[FetchedPage]):
+      if any(page.fetch_method == 'browser' for page in input_pages):
+        return [browser_homepage_group]
+      return [static_subdomain_group]
+
+    with patch.object(self.service, '_fetch_candidate_pages', return_value=static_pages), patch.object(
+      self.service,
+      '_fetch_page_with_browser',
+      return_value=browser_page,
+    ) as browser_fetch_mock, patch.object(
+      self.service.extractor,
+      'extract',
+      side_effect=fake_extract,
+    ):
+      cards = self.service._collect_cards([candidate], max_cards=1)
+
+    self.assertEqual(len(cards), 1)
+    browser_fetch_mock.assert_called_once_with('https://www.minimaxi.com')
+
+  def test_collect_cards_browser_fallback_failure_degrades_gracefully(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/repo',
+      full_name='example/repo',
+      repo_name='repo',
+      owner_name='example',
+      owner_type='Organization',
+      homepage='https://official.minimax.example',
+      description='repo',
+      stars=10,
+    )
+    static_pages = [
+      FetchedPage(
+        requested_url='https://github.com/example/repo',
+        final_url='https://github.com/example/repo',
+        html='<html></html>',
+        title='repo',
+        text='',
+      ),
+      FetchedPage(
+        requested_url='https://official.minimax.example',
+        final_url='https://official.minimax.example',
+        html='<html></html>',
+        title='official',
+        text='',
+      ),
+    ]
+    github_group = ExtractedGroupCandidate(
+      platform=Platform.DISCORD,
+      group_type=GroupType.UNKNOWN,
+      source_url='https://github.com/example/repo',
+      context='discord community',
+      entry_url='https://discord.com/invite/example-repo',
+      fallback_url='https://discord.com/invite/example-repo',
+      source_urls=['https://github.com/example/repo'],
+    )
+
+    with patch.object(self.service, '_fetch_candidate_pages', return_value=static_pages), patch.object(
+      self.service,
+      '_fetch_page_with_browser',
+      return_value=None,
+    ) as browser_fetch_mock, patch.object(
+      self.service.extractor,
+      'extract',
+      return_value=[github_group],
+    ):
+      cards = self.service._collect_cards([candidate], max_cards=1)
+
+    self.assertEqual(len(cards), 1)
+    browser_fetch_mock.assert_called_once_with('https://official.minimax.example')
 
   def test_dedupe_groups_prefers_image_hash_and_merges_sources(self):
     image_bytes = make_image_bytes(520, 520)
@@ -2141,6 +2457,10 @@ class EntryExtractorTests(unittest.TestCase):
     self.assertIn('official account', nearby.lower())
     self.assertNotIn('discussion group', nearby.lower())
 
+  def test_strong_group_intent_includes_wechat_and_feishu_group_terms(self):
+    self.assertTrue(self.extractor._has_strong_group_intent('\u5fae\u4fe1\u7fa4\u4e8c\u7ef4\u7801'))
+    self.assertTrue(self.extractor._has_strong_group_intent('\u98de\u4e66\u7fa4\u4e8c\u7ef4\u7801'))
+
   def test_collect_nearby_text_uses_adjacent_text_for_multi_image_parent(self):
     soup = BeautifulSoup(
       '''
@@ -2161,6 +2481,27 @@ class EntryExtractorTests(unittest.TestCase):
     self.assertNotIn('discussion group', first_nearby)
     self.assertIn('discussion group', second_nearby)
     self.assertNotIn('official account', second_nearby)
+
+  def test_allows_undecoded_qr_with_wechat_group_strong_intent(self):
+    qr_points = np.array([[[80.0, 80.0], [220.0, 80.0], [220.0, 220.0], [80.0, 220.0]]], dtype=np.float32)
+
+    with patch.object(self.extractor, '_analyze_qrcode', return_value=(None, qr_points)), patch.object(
+      self.extractor,
+      '_crop_qrcode',
+      return_value=self.small_square_image,
+    ):
+      candidate = self.extractor._extract_visual_candidate(
+        image_url='https://cdn.example.com/static/hash-image',
+        page_url='https://example.com',
+        full_context='\u5fae\u4fe1\u7fa4\u4e8c\u7ef4\u7801',
+        image_bytes=self.square_image,
+        content_type='image/png',
+        entry_url=None,
+      )
+
+    self.assertIsNotNone(candidate)
+    assert candidate is not None
+    self.assertEqual(candidate.platform, Platform.WECHAT)
 
   def test_rejects_official_account_visual_candidate_without_group_intent(self):
     qr_points = np.array([[[80.0, 80.0], [220.0, 80.0], [220.0, 220.0], [80.0, 220.0]]], dtype=np.float32)
@@ -2511,6 +2852,28 @@ class EntryExtractorTests(unittest.TestCase):
     self.assertIsNone(payload)
     self.assertIsNotNone(points)
     self.assertIn((214, 214), calls)
+
+  def test_analyze_qrcode_medium_image_retries_with_white_border(self):
+    medium = np.full((530, 530, 3), 255, dtype=np.uint8)
+    calls: list[tuple[int, int]] = []
+
+    def fake_detect(_detector, image):
+      h, w = image.shape[:2]
+      calls.append((w, h))
+      if (w, h) == (610, 610):
+        points = np.array(
+          [[[80.0, 80.0], [260.0, 80.0], [260.0, 260.0], [80.0, 260.0]]],
+          dtype=np.float32,
+        )
+        return 'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=test', points
+      return None, None
+
+    with patch.object(self.extractor, '_detect_qrcode_once', side_effect=fake_detect):
+      payload, points = self.extractor._analyze_qrcode(medium)
+
+    self.assertIsNotNone(payload)
+    self.assertIsNotNone(points)
+    self.assertIn((610, 610), calls)
 
   def test_analyze_qrcode_retries_with_preprocess_upsampling(self):
     sample = np.full((320, 320, 3), 255, dtype=np.uint8)
