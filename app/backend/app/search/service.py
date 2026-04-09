@@ -32,7 +32,13 @@ from app.api.schemas import (
 from app.core.config import Settings
 from app.db.database import get_connection
 from app.search.entry_extractor import EntryExtractor
-from app.search.models import ExtractedGroupCandidate, FetchedPage, GitHubRepositoryCandidate, SearchResultLink
+from app.search.models import (
+  ExtractedGroupCandidate,
+  ExtraVisualSource,
+  FetchedPage,
+  GitHubRepositoryCandidate,
+  SearchResultLink,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +67,9 @@ MAX_OFFICIAL_BROWSER_FALLBACK_CANDIDATES = 3
 MAX_WEB_OFFICIAL_BROWSER_FALLBACK_CANDIDATES = 2
 BROWSER_FETCH_TIMEOUT_MS = 20_000
 BROWSER_WAIT_AFTER_LOAD_MS = 1_500
+MAX_BROWSER_EXTRA_VISUAL_SOURCES = 10
+MAX_BROWSER_EXTRA_DATA_URL_CHARS = 900_000
+MAX_BROWSER_VISUAL_SCAN_ELEMENTS = 1200
 SEARCH_CACHE_TTL_SECONDS = 24 * 60 * 60
 CJK_PATTERN = re.compile(r'[\u3400-\u9fff]')
 MAX_GITHUB_SEARCH_PER_PAGE = 50
@@ -2053,6 +2062,7 @@ class SearchService:
           except PlaywrightTimeoutError:
             pass
           page.wait_for_timeout(BROWSER_WAIT_AFTER_LOAD_MS)
+          extra_visual_sources = self._collect_browser_extra_visual_sources(page)
           html = page.content()
           final_url = page.url
           title = page.title()
@@ -2071,7 +2081,164 @@ class SearchService:
       text=soup.get_text(' ', strip=True)[:2000],
       fetch_method='browser',
       soup=soup,
+      extra_visual_sources=extra_visual_sources,
     )
+
+  def _collect_browser_extra_visual_sources(self, page) -> tuple[ExtraVisualSource, ...]:
+    try:
+      raw_sources = page.evaluate(
+        '''
+        (options) => {
+          const maxElements = Number(options?.maxElements || 1200);
+          const minCanvasSide = Number(options?.minCanvasSide || 160);
+          const normalizeText = (value, maxLen = 180) => {
+            if (!value) return '';
+            return String(value).replace(/\\s+/g, ' ').trim().slice(0, maxLen);
+          };
+          const parseBackgroundUrls = (value) => {
+            if (!value || value === 'none') return [];
+            const urls = [];
+            const regex = /url\\((['"]?)(.*?)\\1\\)/g;
+            let match = regex.exec(value);
+            while (match) {
+              const candidate = (match[2] || '').trim();
+              if (candidate) {
+                urls.push(candidate);
+              }
+              match = regex.exec(value);
+            }
+            return urls;
+          };
+          const buildContext = (element, sourceType) => {
+            const parts = [];
+            const attrs = ['aria-label', 'title', 'alt', 'role'];
+            for (const attr of attrs) {
+              const value = element.getAttribute ? element.getAttribute(attr) : '';
+              const normalized = normalizeText(value, 120);
+              if (normalized) {
+                parts.push(normalized);
+              }
+            }
+            const ownText = normalizeText(element.textContent || '');
+            if (ownText) {
+              parts.push(ownText);
+            }
+            const parentText = normalizeText(element.parentElement?.textContent || '');
+            if (parentText) {
+              parts.push(parentText);
+            }
+            if (sourceType) {
+              parts.push(sourceType);
+            }
+            return Array.from(new Set(parts)).join(' ').slice(0, 320);
+          };
+          const resolveUrl = (candidate) => {
+            try {
+              return new URL(candidate, window.location.href).href;
+            } catch (error) {
+              return '';
+            }
+          };
+          const findEntryUrl = (element) => {
+            const anchor = element.closest ? element.closest('a[href]') : null;
+            return anchor && anchor.href ? anchor.href : null;
+          };
+
+          const results = [];
+          const seen = new Set();
+          const pushResult = (imageUrl, element, sourceType) => {
+            if (!imageUrl) return;
+            const key = `${sourceType}:${imageUrl}`;
+            if (seen.has(key)) return;
+            seen.add(key);
+            results.push({
+              image_url: imageUrl,
+              context: buildContext(element, sourceType),
+              entry_url: findEntryUrl(element),
+              source_type: sourceType,
+            });
+          };
+
+          const allElements = document.body ? document.body.querySelectorAll('*') : [];
+          const inspectCount = Math.min(allElements.length, maxElements);
+          for (let index = 0; index < inspectCount; index += 1) {
+            const element = allElements[index];
+            if (!(element instanceof Element)) continue;
+
+            const computedStyle = window.getComputedStyle(element);
+            const bgImage = computedStyle?.getPropertyValue('background-image') || '';
+            for (const bgUrl of parseBackgroundUrls(bgImage)) {
+              const absolute = resolveUrl(bgUrl);
+              if (absolute) {
+                pushResult(absolute, element, 'background-image');
+              }
+            }
+          }
+
+          const canvases = document.querySelectorAll('canvas');
+          for (const canvas of canvases) {
+            if (!(canvas instanceof HTMLCanvasElement)) continue;
+            if (Math.min(canvas.width, canvas.height) < minCanvasSide) continue;
+            if ((canvas.width * canvas.height) > 2_500_000) continue;
+            try {
+              const dataUrl = canvas.toDataURL('image/png');
+              if (dataUrl && dataUrl.startsWith('data:image/')) {
+                pushResult(dataUrl, canvas, 'canvas');
+              }
+            } catch (error) {
+              // Ignore tainted canvas / blocked exports.
+            }
+          }
+
+          return results;
+        }
+        ''',
+        {
+          'maxElements': MAX_BROWSER_VISUAL_SCAN_ELEMENTS,
+          'minCanvasSide': 160,
+        },
+      )
+    except Exception:
+      return ()
+
+    if not isinstance(raw_sources, list):
+      return ()
+
+    sources: list[ExtraVisualSource] = []
+    seen_urls: set[tuple[str, str | None]] = set()
+    for source in raw_sources:
+      if not isinstance(source, dict):
+        continue
+      image_url = str(source.get('image_url') or '').strip()
+      if not image_url:
+        continue
+      if image_url.startswith('blob:'):
+        continue
+      if image_url.startswith('data:image/') and len(image_url) > MAX_BROWSER_EXTRA_DATA_URL_CHARS:
+        continue
+
+      context = str(source.get('context') or '').strip()[:320]
+      entry_url_value = str(source.get('entry_url') or '').strip()
+      entry_url = entry_url_value or None
+      dedupe_key = (image_url, entry_url)
+      if dedupe_key in seen_urls:
+        continue
+      seen_urls.add(dedupe_key)
+
+      source_type_value = str(source.get('source_type') or '').strip()
+      source_type = source_type_value or None
+      sources.append(
+        ExtraVisualSource(
+          image_url=image_url,
+          context=context,
+          entry_url=entry_url,
+          source_type=source_type,
+        ),
+      )
+      if len(sources) >= MAX_BROWSER_EXTRA_VISUAL_SOURCES:
+        break
+
+    return tuple(sources)
 
   def _collect_relevant_links(
     self,

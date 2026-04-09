@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup, Tag
 
 from app.api.schemas import GroupType, Platform
 from app.core.config import Settings
-from app.search.models import ExtractedGroupCandidate, FetchedPage
+from app.search.models import ExtraVisualSource, ExtractedGroupCandidate, FetchedPage
 
 PLATFORM_HINTS = {
   Platform.WECHAT: (
@@ -207,6 +207,7 @@ QR_SLIDING_MIN_LONG_SIDE = 1200
 QR_MAX_WINDOWS_PER_SCALE = 24
 QR_PREPROCESS_SCALES = (1.0, 1.5)
 QR_PREPROCESS_MAX_SIDE = 900
+QR_HARD_PREPROCESS_MAX_SIDE = 1200
 QRCODE_URL_HINTS = (
   'qrcode',
   'qr-code',
@@ -330,6 +331,20 @@ class EntryExtractor:
         for candidate in self._extract_qq_number_candidates(block, page.final_url):
           ordered_candidates.append((next_order, candidate))
           next_order += 1
+
+      for source in page.extra_visual_sources:
+        if visual_attempts >= MAX_VISUAL_ATTEMPTS_PER_PAGE:
+          break
+        task = self._build_visual_task_from_extra_source(
+          source,
+          page.final_url,
+          order=next_order,
+        )
+        if task is None:
+          continue
+        visual_tasks.append(task)
+        visual_attempts += 1
+        next_order += 1
 
       ordered_candidates.extend(self._extract_visual_candidates(visual_tasks))
       ordered_candidates.sort(key=lambda item: item[0])
@@ -669,6 +684,36 @@ class EntryExtractor:
       page_url=page_url,
       full_context=full_context,
       entry_url=None,
+    )
+
+  def _build_visual_task_from_extra_source(
+    self,
+    source: ExtraVisualSource,
+    page_url: str,
+    *,
+    order: int,
+  ) -> VisualCandidateTask | None:
+    image_url = source.image_url.strip()
+    if not image_url:
+      return None
+
+    absolute_image = urljoin(page_url, image_url)
+    entry_url = urljoin(page_url, source.entry_url) if source.entry_url else None
+    source_type = source.source_type or ''
+    image_context_ref = absolute_image
+    if absolute_image.startswith('data:image/'):
+      image_context_ref = absolute_image.split(',', 1)[0]
+    full_context = f'{source.context} {source_type} {entry_url or ""} {image_context_ref}'.strip()
+    resolved_url = self._resolve_camo_url(absolute_image)
+    if not self._should_consider_visual_candidate(resolved_url, full_context, entry_url):
+      return None
+
+    return VisualCandidateTask(
+      order=order,
+      image_url=absolute_image,
+      page_url=page_url,
+      full_context=full_context,
+      entry_url=entry_url,
     )
 
   def _extract_visual_candidates(self, tasks: list[VisualCandidateTask]) -> list[tuple[int, ExtractedGroupCandidate]]:
@@ -1066,34 +1111,37 @@ class EntryExtractor:
       if bordered_points is not None:
         return bordered_payload, bordered_points
 
-    if max(height, width) < QR_SLIDING_MIN_LONG_SIDE:
-      return None, None
+    if max(height, width) >= QR_SLIDING_MIN_LONG_SIDE:
+      for scale in QR_PYRAMID_SCALES:
+        if scale == 1.0:
+          scaled = image
+        else:
+          scaled = cv2.resize(
+            image,
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            interpolation=cv2.INTER_AREA,
+          )
 
-    for scale in QR_PYRAMID_SCALES:
-      if scale == 1.0:
-        scaled = image
-      else:
-        scaled = cv2.resize(
-          image,
-          (max(1, int(width * scale)), max(1, int(height * scale))),
-          interpolation=cv2.INTER_AREA,
-        )
+        for x1, y1, x2, y2 in self._iter_sliding_windows(
+          scaled.shape[1],
+          scaled.shape[0],
+          window_size=QR_SLIDING_WINDOW_SIZE,
+          stride=QR_SLIDING_WINDOW_STRIDE,
+          max_windows=QR_MAX_WINDOWS_PER_SCALE,
+        ):
+          patch = scaled[y1:y2, x1:x2]
+          patch_payload, patch_points = self._detect_qrcode_once(detector, patch)
+          if patch_points is None:
+            continue
 
-      for x1, y1, x2, y2 in self._iter_sliding_windows(
-        scaled.shape[1],
-        scaled.shape[0],
-        window_size=QR_SLIDING_WINDOW_SIZE,
-        stride=QR_SLIDING_WINDOW_STRIDE,
-        max_windows=QR_MAX_WINDOWS_PER_SCALE,
-      ):
-        patch = scaled[y1:y2, x1:x2]
-        patch_payload, patch_points = self._detect_qrcode_once(detector, patch)
-        if patch_points is None:
-          continue
+          mapped = self._map_patch_points_to_original(patch_points, x1, y1, scale)
+          if mapped is not None:
+            return patch_payload, mapped
 
-        mapped = self._map_patch_points_to_original(patch_points, x1, y1, scale)
-        if mapped is not None:
-          return patch_payload, mapped
+    if max(height, width) <= QR_HARD_PREPROCESS_MAX_SIDE:
+      hard_payload, hard_points = self._detect_qrcode_with_hard_preprocess(detector, image)
+      if hard_points is not None:
+        return hard_payload, hard_points
 
     return None, None
 
@@ -1152,6 +1200,7 @@ class EntryExtractor:
     image: np.ndarray,
   ) -> tuple[str | None, np.ndarray | None]:
     height, width = image.shape[:2]
+    border_value: int | tuple[int, int, int] = 255 if image.ndim == 2 else (255, 255, 255)
     for padding in SMALL_QR_BORDER_PADDINGS:
       bordered = cv2.copyMakeBorder(
         image,
@@ -1160,7 +1209,7 @@ class EntryExtractor:
         padding,
         padding,
         borderType=cv2.BORDER_CONSTANT,
-        value=(255, 255, 255),
+        value=border_value,
       )
       payload, points = self._detect_qrcode_once(detector, bordered)
       if points is None:
@@ -1177,6 +1226,97 @@ class EntryExtractor:
       return payload, normalized.reshape(1, normalized.shape[0], 2)
 
     return None, None
+
+  def _detect_qrcode_with_hard_preprocess(
+    self,
+    detector: cv2.QRCodeDetector,
+    image: np.ndarray,
+  ) -> tuple[str | None, np.ndarray | None]:
+    grayscale = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe_image = clahe.apply(grayscale)
+    adaptive = cv2.adaptiveThreshold(
+      clahe_image,
+      255,
+      cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+      cv2.THRESH_BINARY,
+      31,
+      2,
+    )
+    bilateral = cv2.bilateralFilter(grayscale, 7, 75, 75)
+    _, otsu = cv2.threshold(bilateral, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    inverted = cv2.bitwise_not(otsu)
+
+    for variant in (adaptive, otsu, inverted):
+      payload, points = self._detect_qrcode_once(detector, variant)
+      if points is None:
+        continue
+      if payload:
+        return payload, points
+
+      perspective_payload, perspective_points = self._retry_decode_from_qr_points(detector, variant, points)
+      if perspective_points is not None:
+        return perspective_payload, points
+
+    return None, None
+
+  def _retry_decode_from_qr_points(
+    self,
+    detector: cv2.QRCodeDetector,
+    image: np.ndarray,
+    points: np.ndarray,
+  ) -> tuple[str | None, np.ndarray | None]:
+    normalized = np.array(points, dtype=np.float32)
+    if normalized.ndim == 3:
+      normalized = normalized[0]
+    if normalized.ndim != 2 or normalized.shape[0] < 4 or normalized.shape[1] != 2:
+      return None, None
+
+    ordered = self._order_qr_points(normalized[:4])
+    if ordered is None:
+      return None, None
+
+    width_a = float(np.linalg.norm(ordered[2] - ordered[3]))
+    width_b = float(np.linalg.norm(ordered[1] - ordered[0]))
+    height_a = float(np.linalg.norm(ordered[1] - ordered[2]))
+    height_b = float(np.linalg.norm(ordered[0] - ordered[3]))
+    side = int(max(width_a, width_b, height_a, height_b))
+    if side < 64:
+      return None, None
+
+    destination = np.array(
+      [[0.0, 0.0], [float(side - 1), 0.0], [float(side - 1), float(side - 1)], [0.0, float(side - 1)]],
+      dtype=np.float32,
+    )
+    transform = cv2.getPerspectiveTransform(ordered, destination)
+    warped = cv2.warpPerspective(image, transform, (side, side), flags=cv2.INTER_CUBIC)
+
+    payload, detected_points = self._detect_qrcode_once(detector, warped)
+    if detected_points is not None:
+      return payload, detected_points
+
+    bordered_payload, bordered_points = self._detect_qrcode_with_white_border(detector, warped)
+    if bordered_points is not None:
+      return bordered_payload, bordered_points
+
+    return None, None
+
+  def _order_qr_points(self, points: np.ndarray) -> np.ndarray | None:
+    if points.shape != (4, 2):
+      return None
+
+    sums = points.sum(axis=1)
+    diffs = np.diff(points, axis=1).reshape(-1)
+    ordered = np.zeros((4, 2), dtype=np.float32)
+    ordered[0] = points[np.argmin(sums)]
+    ordered[2] = points[np.argmax(sums)]
+    ordered[1] = points[np.argmin(diffs)]
+    ordered[3] = points[np.argmax(diffs)]
+
+    unique_points = {tuple(point) for point in ordered}
+    if len(unique_points) < 4:
+      return None
+    return ordered
 
   def _iter_sliding_windows(
     self,

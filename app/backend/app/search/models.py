@@ -37,6 +37,15 @@ class FetchedPage:
   text: str
   fetch_method: str = 'http'
   soup: BeautifulSoup | None = None
+  extra_visual_sources: tuple['ExtraVisualSource', ...] = ()
+
+
+@dataclass(frozen=True)
+class ExtraVisualSource:
+  image_url: str
+  context: str = ''
+  entry_url: str | None = None
+  source_type: str | None = None
 
 
 @dataclass(frozen=True)

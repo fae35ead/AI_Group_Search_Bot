@@ -1,3 +1,4 @@
+import base64
 import csv
 from dataclasses import replace
 import hashlib
@@ -18,7 +19,7 @@ from app.api.schemas import GroupDiscoveryStatus, GroupType, Platform, ProductCa
 from app.core.config import get_settings
 from app.db.database import get_connection, initialize_database
 from app.search.entry_extractor import EntryExtractor
-from app.search.models import ExtractedGroupCandidate, FetchedPage, GitHubRepositoryCandidate
+from app.search.models import ExtraVisualSource, ExtractedGroupCandidate, FetchedPage, GitHubRepositoryCandidate
 from app.search.service import SearchService
 from main import app
 
@@ -2273,6 +2274,71 @@ class EntryExtractorTests(unittest.TestCase):
     self.assertTrue(candidates[0].image_url.endswith('footer-wechat-qrcode.png'))
     self.assertEqual(candidates[0].source_url, 'https://example.com')
 
+  def test_extract_uses_browser_background_image_visual_source(self):
+    page = FetchedPage(
+      requested_url='https://example.com/community',
+      final_url='https://example.com/community',
+      html='<html><body><footer>community</footer></body></html>',
+      title='Community',
+      text='',
+      fetch_method='browser',
+      extra_visual_sources=(
+        ExtraVisualSource(
+          image_url='https://cdn.example.com/bg-wechat-qrcode.png',
+          context='wechat discussion group qrcode join',
+          entry_url='https://example.com/community',
+          source_type='background-image',
+        ),
+      ),
+    )
+    qr_points = np.array([[[80.0, 80.0], [220.0, 80.0], [220.0, 220.0], [80.0, 220.0]]], dtype=np.float32)
+
+    with patch.object(
+      self.extractor,
+      '_download_image',
+      return_value=(self.square_image, 'image/png'),
+    ), patch.object(
+      self.extractor,
+      '_analyze_qrcode',
+      return_value=(None, qr_points),
+    ):
+      candidates = self.extractor.extract([page])
+
+    self.assertEqual(len(candidates), 1)
+    self.assertEqual(candidates[0].platform, Platform.WECHAT)
+    self.assertTrue(candidates[0].image_url.endswith('bg-wechat-qrcode.png'))
+
+  def test_extract_uses_browser_canvas_visual_source(self):
+    canvas_data_url = f"data:image/png;base64,{base64.b64encode(self.square_image).decode('ascii')}"
+    page = FetchedPage(
+      requested_url='https://example.com/community',
+      final_url='https://example.com/community',
+      html='<html><body><canvas></canvas></body></html>',
+      title='Community',
+      text='',
+      fetch_method='browser',
+      extra_visual_sources=(
+        ExtraVisualSource(
+          image_url=canvas_data_url,
+          context='feishu official discussion group qrcode',
+          entry_url=None,
+          source_type='canvas',
+        ),
+      ),
+    )
+    qr_points = np.array([[[80.0, 80.0], [220.0, 80.0], [220.0, 220.0], [80.0, 220.0]]], dtype=np.float32)
+
+    with patch.object(
+      self.extractor,
+      '_analyze_qrcode',
+      return_value=(None, qr_points),
+    ):
+      candidates = self.extractor.extract([page])
+
+    self.assertEqual(len(candidates), 1)
+    self.assertEqual(candidates[0].platform, Platform.FEISHU)
+    self.assertTrue(candidates[0].image_url.startswith('data:image/png;base64,'))
+
   def test_extract_github_page_keeps_readme_scoping(self):
     page = FetchedPage(
       requested_url='https://github.com/example/repo',
@@ -2896,6 +2962,32 @@ class EntryExtractorTests(unittest.TestCase):
     self.assertIsNone(payload)
     self.assertIsNotNone(points)
     self.assertIn((480, 480), calls)
+
+  def test_analyze_qrcode_uses_hard_preprocess_after_standard_branches(self):
+    sample = np.full((700, 700, 3), 255, dtype=np.uint8)
+    hard_points = np.array(
+      [[[80.0, 80.0], [260.0, 80.0], [260.0, 260.0], [80.0, 260.0]]],
+      dtype=np.float32,
+    )
+
+    with patch.object(self.extractor, '_detect_qrcode_once', return_value=(None, None)), patch.object(
+      self.extractor,
+      '_detect_qrcode_with_preprocess',
+      return_value=(None, None),
+    ), patch.object(
+      self.extractor,
+      '_detect_qrcode_with_white_border',
+      return_value=(None, None),
+    ), patch.object(
+      self.extractor,
+      '_detect_qrcode_with_hard_preprocess',
+      return_value=('https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=test', hard_points),
+    ) as hard_preprocess_mock:
+      payload, points = self.extractor._analyze_qrcode(sample)
+
+    hard_preprocess_mock.assert_called_once()
+    self.assertEqual(payload, 'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=test')
+    self.assertIsNotNone(points)
     mapped = np.squeeze(points)
     self.assertLessEqual(float(mapped.max()), 320.0)
 
