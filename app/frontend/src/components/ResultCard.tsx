@@ -30,6 +30,7 @@ type ResultCardProps = {
   formatStars: (value: number | null) => string
   onCopyQQNumber: (qqNumber: string) => void
   onMarkViewed: (card: ProductCard, group: OfficialGroup) => void
+  onMarkIgnored: (card: ProductCard, group: OfficialGroup) => void
   onToggleExpanded: (productId: string) => void
 }
 
@@ -42,6 +43,7 @@ export function ResultCard({
   formatStars,
   onCopyQQNumber,
   onMarkViewed,
+  onMarkIgnored,
   onToggleExpanded,
 }: ResultCardProps) {
   const groups = dedupeGroups(card.groups)
@@ -52,7 +54,6 @@ export function ResultCard({
   }
 
   const secondaryGroups = groups.filter((group) => group.groupId !== primaryGroup.groupId)
-  const primaryGroupLabel = getGroupLabel(primaryGroup)
   const isPrimaryMarking = markingGroupIds.includes(primaryGroup.groupId)
 
   return (
@@ -123,7 +124,6 @@ export function ResultCard({
       </div>
 
       <div className="card-utility-row">
-        <span className="card-utility-note">{primaryGroupLabel}</span>
         <button
           className="mini-action aligned-action"
           disabled={isPrimaryMarking}
@@ -131,6 +131,14 @@ export function ResultCard({
           type="button"
         >
           {isPrimaryMarking ? '处理中…' : '入库'}
+        </button>
+        <button
+          className="mini-action secondary-mark aligned-action"
+          disabled={isPrimaryMarking}
+          onClick={() => void onMarkIgnored(card, primaryGroup)}
+          type="button"
+        >
+          忽略
         </button>
         <div className="action-column action-column-right">
           {secondaryGroups.length > 0 ? (
@@ -193,6 +201,15 @@ export function ResultCard({
                         type="button"
                       >
                         {isMarking ? '处理中…' : '入库'}
+                      </button>
+
+                      <button
+                        className="mini-action secondary-mark aligned-action"
+                        disabled={isMarking}
+                        onClick={() => void onMarkIgnored(card, group)}
+                        type="button"
+                      >
+                        忽略
                       </button>
 
                       <div className="action-column action-column-right">

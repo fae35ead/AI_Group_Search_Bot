@@ -3,6 +3,7 @@ import csv
 from dataclasses import replace
 import hashlib
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import mkdtemp
@@ -15,12 +16,12 @@ import numpy as np
 from fastapi.testclient import TestClient
 from bs4 import BeautifulSoup
 
-from app.api.schemas import GroupDiscoveryStatus, GroupType, Platform, ProductCard, QQNumberEntry, RecommendationsResponse, RecommendedTool
+from app.api.schemas import GroupDiscoveryStatus, GroupType, Platform, ProductCard, QQNumberEntry, RecommendationsResponse, RecommendedTool, SearchJobStatus
 from app.core.config import get_settings
 from app.db.database import get_connection, initialize_database
 from app.search.entry_extractor import EntryExtractor
 from app.search.models import ExtraVisualSource, ExtractedGroupCandidate, FetchedPage, GitHubRepositoryCandidate
-from app.search.service import SearchService
+from app.search.service import CandidateFetchResult, PreparedSearch, SearchService, ViewedGroupFilters
 from main import app
 
 
@@ -76,7 +77,7 @@ class SearchServiceTests(unittest.TestCase):
     self.service = SearchService(settings)
 
   def tearDown(self):
-    self.service._page_client.close()
+    self.service.close()
 
   def _read_viewed_links_csv(self) -> list[dict[str, str]]:
     csv_path = self.service.settings.viewed_links_csv_path
@@ -95,6 +96,46 @@ class SearchServiceTests(unittest.TestCase):
       group_discovery_status=GroupDiscoveryStatus.NOT_FOUND,
       official_site_url=None,
       github_repo_url=None,
+    )
+
+  def _make_repo_candidate(
+    self,
+    repo_name: str,
+    *,
+    owner_name: str = 'example',
+    description: str | None = None,
+    stars: int = 100,
+    homepage: str | None = None,
+    topics: list[str] | None = None,
+  ) -> GitHubRepositoryCandidate:
+    return GitHubRepositoryCandidate(
+      repo_url=f'https://github.com/{owner_name}/{repo_name}',
+      full_name=f'{owner_name}/{repo_name}',
+      repo_name=repo_name,
+      owner_name=owner_name,
+      owner_type='Organization',
+      homepage=homepage,
+      description=description or repo_name,
+      stars=stars,
+      topics=topics or [],
+      is_fork=False,
+      archived=False,
+      disabled=False,
+    )
+
+  def _make_fetch_result(
+    self,
+    pages: list[FetchedPage],
+    *,
+    seed_extracted_groups: list[ExtractedGroupCandidate] | None = None,
+    seed_has_groups: bool = False,
+    seed_page_count: int | None = None,
+  ) -> CandidateFetchResult:
+    return CandidateFetchResult(
+      pages=pages,
+      seed_extracted_groups=list(seed_extracted_groups or []),
+      seed_has_groups=seed_has_groups,
+      seed_page_count=0 if seed_page_count is None else seed_page_count,
     )
 
   def test_search_returns_empty_for_blank_query(self):
@@ -478,6 +519,46 @@ class SearchServiceTests(unittest.TestCase):
     self.assertTrue(any('qq' in query for query in queried_texts))
     self.assertTrue(any(query.endswith('in:name') and per_page >= 24 for query, per_page in captured_queries))
 
+  def test_github_search_skips_secondary_variants_when_primary_candidates_are_confident(self):
+    captured_queries: list[str] = []
+
+    def fake_search(variant_query: str, per_page: int):
+      del per_page
+      captured_queries.append(variant_query)
+      if variant_query.endswith('in:name'):
+        return [
+          self._make_repo_candidate('FastGPT', stars=2000),
+          self._make_repo_candidate('FastGPT-Studio', stars=1500),
+        ]
+      if variant_query.endswith('in:description'):
+        return [
+          self._make_repo_candidate('fastgpt-agent', stars=1200),
+          self._make_repo_candidate('fastgpt-ui', stars=900),
+        ]
+      return []
+
+    with patch.object(self.service, '_github_search_onevariant', side_effect=fake_search):
+      results = self.service._github_search('FastGPT', limit=4)
+
+    self.assertEqual(len(results), 4)
+    self.assertTrue(any(query.endswith('in:name') for query in captured_queries))
+    self.assertTrue(any(query.endswith('in:description') for query in captured_queries))
+    self.assertFalse(any(query.endswith('in:readme') for query in captured_queries))
+
+  def test_build_crawl_candidates_skips_expansion_when_primary_candidates_are_confident(self):
+    primary = [
+      self._make_repo_candidate('FastGPT', stars=2400),
+      self._make_repo_candidate('FastGPT-Studio', stars=2000),
+      self._make_repo_candidate('FastGPT-Agent', stars=1600),
+      self._make_repo_candidate('FastGPT-UI', stars=1200),
+    ]
+
+    with patch.object(self.service, '_expand_related_candidates', return_value=[]) as expand_mock:
+      crawl_candidates = self.service._build_crawl_candidates('FastGPT', primary, target_count=10)
+
+    self.assertEqual(crawl_candidates, primary)
+    expand_mock.assert_not_called()
+
   def test_fetch_candidate_pages_limits_related_pages(self):
     candidate = GitHubRepositoryCandidate(
       repo_url='https://github.com/labring/FastGPT',
@@ -512,9 +593,9 @@ class SearchServiceTests(unittest.TestCase):
       )
 
     with patch.object(self.service, '_fetch_page', side_effect=fake_fetch):
-      pages = self.service._fetch_candidate_pages(candidate)
+      fetch_result = self.service._fetch_candidate_pages(candidate)
 
-    fetched_urls = {page.final_url for page in pages}
+    fetched_urls = {page.final_url for page in fetch_result.pages}
     self.assertIn('https://github.com/labring/FastGPT', fetched_urls)
     self.assertIn('https://github.com/labring/FastGPT/discussions', fetched_urls)
     self.assertEqual(len(fetched_urls), 2)
@@ -553,12 +634,48 @@ class SearchServiceTests(unittest.TestCase):
       )
 
     with patch.object(self.service, '_fetch_page', side_effect=fake_fetch):
-      pages = self.service._fetch_candidate_pages(candidate)
+      fetch_result = self.service._fetch_candidate_pages(candidate)
 
-    fetched_urls = {page.final_url for page in pages}
+    fetched_urls = {page.final_url for page in fetch_result.pages}
     self.assertIn('https://github.com/n8n-io/n8n', fetched_urls)
     self.assertIn('https://n8n.io', fetched_urls)
     self.assertIn('https://n8n.io/community', fetched_urls)
+
+  def test_fetch_candidate_pages_stops_after_seed_pages_when_seed_pages_already_contain_group(self):
+    candidate = GitHubRepositoryCandidate(
+      repo_url='https://github.com/example/fastgpt',
+      full_name='example/fastgpt',
+      repo_name='fastgpt',
+      owner_name='example',
+      owner_type='Organization',
+      homepage=None,
+      description='fastgpt',
+      stars=100,
+    )
+    fetched_urls: list[str] = []
+
+    def fake_fetch(url: str):
+      fetched_urls.append(url.rstrip('/'))
+      html = (
+        '<html><body>'
+        '<a href="https://discord.gg/fastgpt">Join Discord</a>'
+        '<a href="/community">Community</a>'
+        '</body></html>'
+      )
+      return FetchedPage(
+        requested_url=url,
+        final_url=url.rstrip('/'),
+        html=html,
+        title='FastGPT community',
+        text='Join Discord',
+      )
+
+    with patch.object(self.service, '_fetch_page', side_effect=fake_fetch):
+      fetch_result = self.service._fetch_candidate_pages(candidate)
+
+    self.assertEqual(len(fetch_result.pages), 1)
+    self.assertTrue(fetch_result.seed_has_groups)
+    self.assertEqual(fetched_urls, ['https://github.com/example/fastgpt'])
 
   def test_collect_relevant_links_filters_github_global_noise(self):
     candidate = GitHubRepositoryCandidate(
@@ -594,6 +711,31 @@ class SearchServiceTests(unittest.TestCase):
     self.assertFalse(any('support.github.com' in link for link in links))
     self.assertFalse(any('maintainers.github.com' in link for link in links))
     self.assertFalse(any('premium-support' in link for link in links))
+
+  def test_collect_relevant_links_skips_low_value_docs_link_without_strong_group_signal(self):
+    candidate = self._make_repo_candidate(
+      'repo',
+      homepage='https://repo.example.com',
+      description='repo',
+      stars=20,
+    )
+    page = FetchedPage(
+      requested_url='https://repo.example.com',
+      final_url='https://repo.example.com',
+      html=(
+        '<html><body>'
+        '<a href="/docs/community">Community Docs</a>'
+        '<a href="/community/join">Join community</a>'
+        '</body></html>'
+      ),
+      title='repo',
+      text='',
+    )
+
+    links = self.service._collect_relevant_links(page, candidate)
+
+    self.assertIn('https://repo.example.com/community/join', links)
+    self.assertNotIn('https://repo.example.com/docs/community', links)
 
   def test_collect_relevant_links_supports_chinese_community_anchor(self):
     candidate = GitHubRepositoryCandidate(
@@ -815,7 +957,7 @@ class SearchServiceTests(unittest.TestCase):
     with patch.object(self.service, '_github_search', return_value=[github_candidate]), patch.object(
       self.service,
       '_fetch_candidate_pages',
-      return_value=[github_page],
+      return_value=self._make_fetch_result([github_page]),
     ), patch.object(
       self.service,
       '_expand_related_candidates',
@@ -845,6 +987,138 @@ class SearchServiceTests(unittest.TestCase):
     self.assertEqual(len(first_results), 3)
     self.assertEqual(len(second_results), 3)
     github_search_mock.assert_not_called()
+
+  def test_search_with_job_uses_requested_limit_for_initial_prepare(self):
+    with patch.object(
+      self.service,
+      '_prepare_search',
+      return_value=PreparedSearch(cache_key='cache-key', cached_results=[], merged_candidates=[]),
+    ) as prepare_mock:
+      results, job_id, job_status, is_partial = self.service.search_with_job('n8n', limit=5)
+
+    self.assertEqual(results, [])
+    self.assertIsNone(job_id)
+    self.assertEqual(job_status, SearchJobStatus.COMPLETED)
+    self.assertFalse(is_partial)
+    self.assertEqual(prepare_mock.call_args.kwargs.get('target_limit'), 5)
+
+  def test_run_search_job_reuses_viewed_group_filters_across_batches(self):
+    initial_card = self._make_card(0)
+    remaining_candidates = [
+      self._make_repo_candidate(f'tool-{index}', stars=100 - index)
+      for index in range(8)
+    ]
+    self.service._create_search_job(
+      query='n8n',
+      filters=None,
+      refresh=False,
+      prepared_target_limit=50,
+      cache_key='cache-key',
+      remaining_candidates=remaining_candidates,
+      raw_results=[initial_card],
+      results=[initial_card],
+    )
+    job_id = next(iter(self.service._jobs))
+    batch_cards = [
+      self._make_card(index + 1)
+      for index in range(2)
+    ]
+    viewed_filters = ViewedGroupFilters()
+
+    with patch.object(
+      self.service,
+      '_collect_cards',
+      side_effect=[[batch_cards[0]], [batch_cards[1]]],
+    ), patch.object(
+      self.service,
+      '_load_viewed_group_filters',
+      return_value=viewed_filters,
+    ) as load_filters_mock, patch.object(
+      self.service,
+      '_save_cached_search',
+    ):
+      self.service._run_search_job(job_id)
+
+    self.assertEqual(load_filters_mock.call_count, 1)
+    job = self.service.get_search_job(job_id)
+    self.assertIsNotNone(job)
+    assert job is not None
+    self.assertEqual(job.status, SearchJobStatus.COMPLETED)
+    self.assertEqual(len(job.raw_results), 3)
+
+  def test_run_search_job_avoids_second_prepare_when_seeded_with_remaining_candidates(self):
+    initial_card = self._make_card(0)
+    remaining_candidates = [
+      self._make_repo_candidate(f'tool-{index}', stars=100 - index)
+      for index in range(4)
+    ]
+    self.service._create_search_job(
+      query='n8n',
+      filters=None,
+      refresh=False,
+      prepared_target_limit=50,
+      cache_key='cache-key',
+      remaining_candidates=remaining_candidates,
+      raw_results=[initial_card],
+      results=[initial_card],
+    )
+    job_id = next(iter(self.service._jobs))
+
+    with patch.object(
+      self.service,
+      '_prepare_search',
+      side_effect=AssertionError('should not re-prepare when job already has remaining candidates'),
+    ), patch.object(
+      self.service,
+      '_collect_cards',
+      return_value=[],
+    ), patch.object(
+      self.service,
+      '_load_viewed_group_filters',
+      return_value=ViewedGroupFilters(),
+    ), patch.object(
+      self.service,
+      '_save_cached_search',
+    ):
+      self.service._run_search_job(job_id)
+
+  def test_fetch_page_with_browser_runs_on_dedicated_worker_thread(self):
+    worker_thread_ids: list[int] = []
+    caller_thread_ids: list[int] = [threading.get_ident()]
+    threaded_result: list[str | None] = []
+
+    def fake_browser_worker(url: str):
+      worker_thread_ids.append(threading.get_ident())
+      return url
+
+    def call_from_background() -> None:
+      caller_thread_ids.append(threading.get_ident())
+      threaded_result.append(self.service._fetch_page_with_browser('https://example.com/background'))
+
+    with patch.object(self.service, '_fetch_page_with_browser_worker', side_effect=fake_browser_worker):
+      first_result = self.service._fetch_page_with_browser('https://example.com/main')
+      worker = threading.Thread(target=call_from_background)
+      worker.start()
+      worker.join()
+
+    self.assertEqual(first_result, 'https://example.com/main')
+    self.assertEqual(threaded_result, ['https://example.com/background'])
+    self.assertEqual(len(worker_thread_ids), 2)
+    self.assertEqual(len(set(worker_thread_ids)), 1)
+    self.assertTrue(all(worker_thread_id not in caller_thread_ids for worker_thread_id in worker_thread_ids))
+
+  def test_close_routes_browser_cleanup_through_worker_thread(self):
+    cleanup_thread_ids: list[int] = []
+    caller_thread_id = threading.get_ident()
+
+    def fake_close_browser_worker() -> None:
+      cleanup_thread_ids.append(threading.get_ident())
+
+    with patch.object(self.service, '_close_browser_worker', side_effect=fake_close_browser_worker):
+      self.service.close()
+
+    self.assertEqual(len(cleanup_thread_ids), 1)
+    self.assertNotEqual(cleanup_thread_ids[0], caller_thread_id)
 
   def test_search_uses_web_fallback_when_github_pages_have_no_groups(self):
     github_candidate = GitHubRepositoryCandidate(
@@ -894,8 +1168,8 @@ class SearchServiceTests(unittest.TestCase):
     def fake_fetch_pages(candidate: GitHubRepositoryCandidate, **kwargs):
       del kwargs
       if candidate.full_name == 'web/n8n.io':
-        return [official_page]
-      return [repo_page]
+        return self._make_fetch_result([official_page])
+      return self._make_fetch_result([repo_page])
 
     def fake_extract(pages: list[FetchedPage]):
       if pages and pages[0].final_url == 'https://n8n.io':
@@ -1060,7 +1334,7 @@ class SearchServiceTests(unittest.TestCase):
         title='tool',
         text='',
       )
-      return [page]
+      return self._make_fetch_result([page])
 
     def fake_extract(pages: list[FetchedPage]):
       suffix = pages[0].final_url.rsplit('/', 1)[-1]
@@ -1086,6 +1360,44 @@ class SearchServiceTests(unittest.TestCase):
 
     self.assertEqual(len(cards), 1)
     self.assertLess(fetch_mock.call_count, len(candidates))
+
+  def test_collect_cards_reuses_seed_extraction_without_rerunning_extractor(self):
+    candidate = self._make_repo_candidate('seed-hit', homepage='https://seed-hit.example.com')
+    seed_page = FetchedPage(
+      requested_url='https://github.com/example/seed-hit',
+      final_url='https://github.com/example/seed-hit',
+      html='<html></html>',
+      title='seed-hit',
+      text='',
+    )
+    seed_group = ExtractedGroupCandidate(
+      platform=Platform.DISCORD,
+      group_type=GroupType.UNKNOWN,
+      source_url=seed_page.final_url,
+      context='discord community',
+      entry_url='https://discord.gg/seed-hit',
+      fallback_url='https://discord.gg/seed-hit',
+      source_urls=[seed_page.final_url],
+    )
+
+    with patch.object(
+      self.service,
+      '_fetch_candidate_pages',
+      return_value=self._make_fetch_result(
+        [seed_page],
+        seed_extracted_groups=[seed_group],
+        seed_has_groups=True,
+        seed_page_count=1,
+      ),
+    ), patch.object(
+      self.service.extractor,
+      'extract',
+      side_effect=AssertionError('seed extraction should be reused'),
+    ):
+      cards = self.service._collect_cards([candidate], max_cards=1)
+
+    self.assertEqual(len(cards), 1)
+    self.assertEqual(cards[0].groups[0].platform, Platform.DISCORD)
 
   def test_build_product_card_supports_qq_number_entry(self):
     candidate = GitHubRepositoryCandidate(
@@ -1257,7 +1569,7 @@ class SearchServiceTests(unittest.TestCase):
 
     def fake_fetch(candidate: GitHubRepositoryCandidate, **kwargs):
       del kwargs
-      return [pages[0]] if candidate.repo_name == 'tool-a' else [pages[1]]
+      return self._make_fetch_result([pages[0]]) if candidate.repo_name == 'tool-a' else self._make_fetch_result([pages[1]])
 
     def fake_extract(input_pages: list[FetchedPage]):
       return [groups[0]] if input_pages[0].final_url.endswith('tool-a') else [groups[1]]
@@ -1296,7 +1608,7 @@ class SearchServiceTests(unittest.TestCase):
     with patch.object(
       self.service,
       '_fetch_candidate_pages',
-      return_value=[FetchedPage('https://repo.example.com', 'https://repo.example.com', '<html></html>', 'repo', '')],
+      return_value=self._make_fetch_result([FetchedPage('https://repo.example.com', 'https://repo.example.com', '<html></html>', 'repo', '')]),
     ), patch.object(
       self.service.extractor,
       'extract',
@@ -1325,7 +1637,7 @@ class SearchServiceTests(unittest.TestCase):
       del kwargs
       if candidate.repo_name == 'slow':
         time.sleep(0.05)
-      return [
+      return self._make_fetch_result([
         FetchedPage(
           requested_url=candidate.repo_url or '',
           final_url=f'https://example.com/{candidate.repo_name}',
@@ -1333,7 +1645,7 @@ class SearchServiceTests(unittest.TestCase):
           title=candidate.repo_name,
           text='',
         ),
-      ]
+      ])
 
     def fake_extract(input_pages: list[FetchedPage]):
       repo_name = input_pages[0].final_url.rstrip('/').split('/')[-1]
@@ -1418,7 +1730,7 @@ class SearchServiceTests(unittest.TestCase):
         return [official_group]
       return [github_group]
 
-    with patch.object(self.service, '_fetch_candidate_pages', return_value=static_pages), patch.object(
+    with patch.object(self.service, '_fetch_candidate_pages', return_value=self._make_fetch_result(static_pages)), patch.object(
       self.service,
       '_fetch_page_with_browser',
       return_value=browser_page,
@@ -1468,7 +1780,7 @@ class SearchServiceTests(unittest.TestCase):
       source_urls=['https://official.minimax.example'],
     )
 
-    with patch.object(self.service, '_fetch_candidate_pages', return_value=static_pages), patch.object(
+    with patch.object(self.service, '_fetch_candidate_pages', return_value=self._make_fetch_result(static_pages)), patch.object(
       self.service,
       '_fetch_page_with_browser',
     ) as browser_fetch_mock, patch.object(
@@ -1540,7 +1852,7 @@ class SearchServiceTests(unittest.TestCase):
         return [browser_homepage_group]
       return [static_subdomain_group]
 
-    with patch.object(self.service, '_fetch_candidate_pages', return_value=static_pages), patch.object(
+    with patch.object(self.service, '_fetch_candidate_pages', return_value=self._make_fetch_result(static_pages)), patch.object(
       self.service,
       '_fetch_page_with_browser',
       return_value=browser_page,
@@ -1591,7 +1903,7 @@ class SearchServiceTests(unittest.TestCase):
       source_urls=['https://github.com/example/repo'],
     )
 
-    with patch.object(self.service, '_fetch_candidate_pages', return_value=static_pages), patch.object(
+    with patch.object(self.service, '_fetch_candidate_pages', return_value=self._make_fetch_result(static_pages)), patch.object(
       self.service,
       '_fetch_page_with_browser',
       return_value=None,
@@ -2238,6 +2550,25 @@ class EntryExtractorTests(unittest.TestCase):
 
     self.assertEqual(len(candidates), 1)
     self.assertEqual(candidates[0].platform, Platform.WECOM)
+
+  def test_extract_skips_visual_scan_for_page_without_discovery_signal(self):
+    page = FetchedPage(
+      requested_url='https://example.com/changelog',
+      final_url='https://example.com/changelog',
+      html='''
+        <html><body>
+          <img alt="release preview" src="https://example.com/release.png" />
+          <p>Version 2026.04.10 improved performance and stability.</p>
+        </body></html>
+      ''',
+      title='Release Notes',
+      text='Version 2026.04.10 improved performance and stability.',
+    )
+
+    with patch.object(self.extractor, '_extract_visual_candidates', side_effect=AssertionError('should skip visual scan')):
+      candidates = self.extractor.extract([page])
+
+    self.assertEqual(candidates, [])
 
   def test_extract_non_github_page_scans_footer_qrcode(self):
     page = FetchedPage(
@@ -3065,14 +3396,20 @@ class SearchApiTests(unittest.TestCase):
     self.client = TestClient(app)
 
   def _test_search_returns_empty_message_when_no_results_legacy(self):
-    with patch('app.api.routes.search_service.search', return_value=[]):
+    with patch(
+      'app.api.routes.search_service.search_with_job',
+      return_value=([], None, SearchJobStatus.COMPLETED, False),
+    ):
       response = self.client.post('/api/search', json={'query': 'some_nonexistent_product_xyz'})
 
     self.assertEqual(response.status_code, 200)
     self.assertEqual(response.json()['empty_message'], '未在 GitHub 相关仓库中发现群聊二维码')
 
   def test_search_returns_empty_message_when_no_results(self):
-    with patch('app.api.routes.search_service.search', return_value=[]):
+    with patch(
+      'app.api.routes.search_service.search_with_job',
+      return_value=([], None, SearchJobStatus.COMPLETED, False),
+    ):
       response = self.client.post('/api/search', json={'query': 'some_nonexistent_product_xyz'})
 
     self.assertEqual(response.status_code, 200)
@@ -3091,7 +3428,10 @@ class SearchApiTests(unittest.TestCase):
       official_site_url='https://testapp.dev',
       github_repo_url='https://github.com/example/testapp',
     )
-    with patch('app.api.routes.search_service.search', return_value=[mock_card]):
+    with patch(
+      'app.api.routes.search_service.search_with_job',
+      return_value=([mock_card], None, SearchJobStatus.COMPLETED, False),
+    ):
       response = self.client.post('/api/search', json={'query': 'testapp'})
 
     self.assertEqual(response.status_code, 200)
@@ -3128,7 +3468,10 @@ class SearchApiTests(unittest.TestCase):
       official_site_url='https://testapp.dev',
       github_repo_url='https://github.com/example/testapp',
     )
-    with patch('app.api.routes.search_service.search', return_value=[mock_card]):
+    with patch(
+      'app.api.routes.search_service.search_with_job',
+      return_value=([mock_card], None, SearchJobStatus.COMPLETED, False),
+    ):
       response = self.client.post('/api/search', json={'query': 'testapp'})
 
     self.assertEqual(response.status_code, 200)
@@ -3137,11 +3480,61 @@ class SearchApiTests(unittest.TestCase):
     self.assertEqual(len(payload['results'][0]['groups']), 2)
 
   def test_search_refresh_flag_forces_refresh(self):
-    with patch('app.api.routes.search_service.search', return_value=[]) as search_mock:
+    with patch(
+      'app.api.routes.search_service.search_with_job',
+      return_value=([], None, SearchJobStatus.COMPLETED, False),
+    ) as search_mock:
       response = self.client.post('/api/search', json={'query': 'n8n', 'refresh': True})
 
     self.assertEqual(response.status_code, 200)
     self.assertTrue(search_mock.call_args.kwargs.get('refresh'))
+
+  def test_search_returns_partial_job_metadata(self):
+    mock_card = ProductCard(
+      product_id='abc123',
+      app_name='TestApp',
+      description='A test app',
+      github_stars=100,
+      created_at=None,
+      verified_at=datetime.now(timezone.utc),
+      groups=[],
+      group_discovery_status=GroupDiscoveryStatus.NOT_FOUND,
+      official_site_url='https://testapp.dev',
+      github_repo_url='https://github.com/example/testapp',
+    )
+    with patch(
+      'app.api.routes.search_service.search_with_job',
+      return_value=([mock_card], 'job-123', SearchJobStatus.PENDING, True),
+    ):
+      response = self.client.post('/api/search', json={'query': 'testapp'})
+
+    self.assertEqual(response.status_code, 200)
+    payload = response.json()
+    self.assertEqual(payload['job_id'], 'job-123')
+    self.assertEqual(payload['job_status'], 'pending')
+    self.assertTrue(payload['is_partial'])
+
+  def test_get_search_job_endpoint(self):
+    job = unittest.mock.Mock()
+    job.query = 'testapp'
+    job.results = []
+    job.empty_message = None
+    job.job_id = 'job-123'
+    job.status = SearchJobStatus.RUNNING
+    with patch('app.api.routes.search_service.get_search_job', return_value=job):
+      response = self.client.get('/api/search/jobs/job-123')
+
+    self.assertEqual(response.status_code, 200)
+    payload = response.json()
+    self.assertEqual(payload['job_id'], 'job-123')
+    self.assertEqual(payload['job_status'], 'running')
+    self.assertTrue(payload['is_partial'])
+
+  def test_get_search_job_returns_404_when_missing(self):
+    with patch('app.api.routes.search_service.get_search_job', return_value=None):
+      response = self.client.get('/api/search/jobs/missing-job')
+
+    self.assertEqual(response.status_code, 404)
 
   def test_recommendations_refresh_flag_forces_refresh(self):
     payload = RecommendationsResponse(
@@ -3188,14 +3581,20 @@ class SearchApiTests(unittest.TestCase):
     remove_mock.assert_called_once_with('group001')
 
   def test_search_forwards_limit_parameter(self):
-    with patch('app.api.routes.search_service.search', return_value=[]) as search_mock:
+    with patch(
+      'app.api.routes.search_service.search_with_job',
+      return_value=([], None, SearchJobStatus.COMPLETED, False),
+    ) as search_mock:
       response = self.client.post('/api/search', json={'query': 'n8n', 'limit': 50})
 
     self.assertEqual(response.status_code, 200)
     self.assertEqual(search_mock.call_args.kwargs.get('limit'), 50)
 
   def test_search_rejects_limit_above_hard_limit(self):
-    with patch('app.api.routes.search_service.search', return_value=[]) as search_mock:
+    with patch(
+      'app.api.routes.search_service.search_with_job',
+      return_value=([], None, SearchJobStatus.COMPLETED, False),
+    ) as search_mock:
       response = self.client.post('/api/search', json={'query': 'n8n', 'limit': 51})
 
     self.assertEqual(response.status_code, 422)

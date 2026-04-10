@@ -1,12 +1,35 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+import os
+
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+
+
+project_root = Path.cwd()
+frontend_dist_dir = project_root.parent / 'frontend' / 'dist'
+playwright_browsers_dir = Path(os.environ.get('PLAYWRIGHT_BROWSERS_PATH', Path.home() / 'AppData' / 'Local' / 'ms-playwright'))
+
+if not frontend_dist_dir.exists():
+    raise SystemExit(f'Frontend build output is missing: {frontend_dist_dir}')
+
+datas = [(str(frontend_dist_dir), 'frontend_dist')]
+if playwright_browsers_dir.exists():
+    datas.append((str(playwright_browsers_dir), 'ms-playwright'))
+
+datas += collect_data_files('playwright')
+
+hiddenimports = []
+hiddenimports += collect_submodules('playwright')
+hiddenimports += collect_submodules('uvicorn')
+
 
 a = Analysis(
     ['launcher.py'],
-    pathex=[],
+    pathex=[str(project_root)],
     binaries=[],
-    datas=[('D:\\Obsidian\\repository\\Work\\03 Projects\\AI群聊发现器\\app\\frontend\\dist', 'frontend_dist')],
-    hiddenimports=[],
+    datas=datas,
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

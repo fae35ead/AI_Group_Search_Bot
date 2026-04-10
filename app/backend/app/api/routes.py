@@ -15,8 +15,10 @@ from app.api.schemas import (
   Platform,
   RemoveViewedGroupResponse,
   RecommendationsResponse,
+  SearchJobStatus,
   SearchRequest,
   SearchResponse,
+  ToggleIgnoredResponse,
   ToggleJoinedResponse,
   ViewedGroupsResponse,
 )
@@ -53,7 +55,7 @@ def get_recommendations(refresh: bool = False) -> RecommendationsResponse:
 @router.post('/search', response_model=SearchResponse)
 @limiter.limit('10/minute')
 def search(request: Request, search_request: SearchRequest) -> SearchResponse:
-  results = search_service.search(
+  results, job_id, job_status, is_partial = search_service.search_with_job(
     search_request.query,
     search_request.filters,
     refresh=search_request.refresh,
@@ -63,8 +65,28 @@ def search(request: Request, search_request: SearchRequest) -> SearchResponse:
   return SearchResponse(
     query=search_request.query,
     results=results,
-    empty_message='未在 GitHub/官网相关页面中发现官方群入口' if not results else None,
+    empty_message='\u672a\u5728 GitHub/\u5b98\u7f51\u76f8\u5173\u9875\u9762\u4e2d\u53d1\u73b0\u5b98\u65b9\u7fa4\u5165\u53e3' if not results and not is_partial else None,
+    job_id=job_id,
+    job_status=job_status,
+    is_partial=is_partial,
   )
+
+
+@router.get('/search/jobs/{job_id}', response_model=SearchResponse)
+def get_search_job(job_id: str) -> SearchResponse:
+  job = search_service.get_search_job(job_id)
+  if job is None:
+    raise HTTPException(status_code=404, detail='search job not found')
+
+  return SearchResponse(
+    query=job.query,
+    results=job.results,
+    empty_message=job.empty_message,
+    job_id=job.job_id,
+    job_status=job.status,
+    is_partial=job.status in {SearchJobStatus.PENDING, SearchJobStatus.RUNNING},
+  )
+
 
 @router.get('/groups/viewed', response_model=ViewedGroupsResponse)
 def list_viewed_groups() -> ViewedGroupsResponse:
@@ -77,6 +99,7 @@ def mark_group_viewed(payload: MarkViewedGroupRequest) -> MarkViewedGroupRespons
     product_id=payload.product_id,
     app_name=payload.app_name,
     group=payload.group,
+    is_ignored=payload.is_ignored,
   )
   return MarkViewedGroupResponse(ok=True)
 
@@ -91,6 +114,12 @@ def bulk_mark_viewed(payload: BulkMarkViewedRequest) -> BulkMarkViewedResponse:
 def toggle_group_joined(view_key: str) -> ToggleJoinedResponse:
   is_joined = search_service.toggle_group_joined(view_key)
   return ToggleJoinedResponse(ok=True, is_joined=is_joined)
+
+
+@router.patch('/groups/viewed/{view_key}/ignored', response_model=ToggleIgnoredResponse)
+def toggle_group_ignored(view_key: str) -> ToggleIgnoredResponse:
+  is_ignored = search_service.toggle_group_ignored(view_key)
+  return ToggleIgnoredResponse(ok=True, is_ignored=is_ignored)
 
 
 @router.post('/groups/manual-upload', response_model=ManualUploadResponse)
@@ -143,3 +172,4 @@ async def manual_upload_group(
 def remove_viewed_group(view_key: str) -> RemoveViewedGroupResponse:
   search_service.remove_viewed_group(view_key)
   return RemoveViewedGroupResponse(ok=True)
+

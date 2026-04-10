@@ -14,13 +14,16 @@ const PLATFORM_OPTIONS: Array<{ label: string; value: Platform }> = [
 ]
 
 type JoinedFilter = 'all' | 'joined' | 'unjoined'
+type IgnoredFilter = 'all' | 'normal' | 'ignored'
 
 type ViewedLibraryProps = {
   groups: ViewedGroup[]
   removingKeys: string[]
   togglingJoinedKeys: string[]
+  togglingIgnoredKeys: string[]
   onRemove: (viewKey: string) => void
   onToggleJoined: (viewKey: string) => void
+  onToggleIgnored: (viewKey: string) => void
   onCopyQQNumber: (qqNumber: string) => void
 }
 
@@ -54,13 +57,16 @@ export function ViewedLibrary({
   groups,
   removingKeys,
   togglingJoinedKeys,
+  togglingIgnoredKeys,
   onRemove,
   onToggleJoined,
+  onToggleIgnored,
   onCopyQQNumber,
 }: ViewedLibraryProps) {
   const [search, setSearch] = useState('')
   const [selectedPlatforms, setSelectedPlatforms] = useState<Platform[]>([])
   const [joinedFilter, setJoinedFilter] = useState<JoinedFilter>('all')
+  const [ignoredFilter, setIgnoredFilter] = useState<IgnoredFilter>('normal')
   const [page, setPage] = useState(1)
 
   const filteredGroups = useMemo(() => {
@@ -85,6 +91,14 @@ export function ViewedLibrary({
           return false
         }
 
+        if (ignoredFilter === 'normal' && group.isIgnored) {
+          return false
+        }
+
+        if (ignoredFilter === 'ignored' && !group.isIgnored) {
+          return false
+        }
+
         return true
       })
       .sort((left, right) => {
@@ -97,7 +111,7 @@ export function ViewedLibrary({
       })
 
     return filtered
-  }, [groups, joinedFilter, search, selectedPlatforms])
+  }, [groups, ignoredFilter, joinedFilter, search, selectedPlatforms])
 
   const totalPages = Math.max(1, Math.ceil(filteredGroups.length / PAGE_SIZE))
   const safePage = Math.min(page, totalPages)
@@ -118,6 +132,11 @@ export function ViewedLibrary({
   function handleJoinedFilterChange(value: JoinedFilter) {
     setPage(1)
     setJoinedFilter(value)
+  }
+
+  function handleIgnoredFilterChange(value: IgnoredFilter) {
+    setPage(1)
+    setIgnoredFilter(value)
   }
 
   if (groups.length === 0) {
@@ -168,6 +187,24 @@ export function ViewedLibrary({
           ))}
         </div>
 
+        <div aria-label={'\u5ffd\u7565\u72b6\u6001\u7b5b\u9009'} className="lib-status-chips" role="group">
+          {([
+            ['normal', '\u6b63\u5e38'],
+            ['ignored', '\u5df2\u5ffd\u7565'],
+            ['all', '\u5168\u90e8'],
+          ] as const).map(([value, label]) => (
+            <button
+              key={value}
+              aria-pressed={ignoredFilter === value}
+              className={`platform-filter-chip${ignoredFilter === value ? ' active' : ''}`}
+              type="button"
+              onClick={() => handleIgnoredFilterChange(value)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
         <span className="status-note">{`\u5171 ${filteredGroups.length} \u6761`}</span>
       </div>
 
@@ -179,6 +216,7 @@ export function ViewedLibrary({
             {visibleGroups.map((group) => {
               const isRemoving = removingKeys.includes(group.viewKey)
               const isTogglingJoined = togglingJoinedKeys.includes(group.viewKey)
+              const isTogglingIgnored = togglingIgnoredKeys.includes(group.viewKey)
               let entryAction: React.ReactNode = null
 
               if (group.entry.type === 'qrcode') {
@@ -268,6 +306,15 @@ export function ViewedLibrary({
                           onClick={() => onRemove(group.viewKey)}
                         >
                           {isRemoving ? '\u79fb\u9664\u4e2d...' : '\u79fb\u9664'}
+                        </button>
+
+                        <button
+                          className="source-link compact-link"
+                          disabled={isTogglingIgnored}
+                          type="button"
+                          onClick={() => onToggleIgnored(group.viewKey)}
+                        >
+                          {isTogglingIgnored ? '\u5904\u7406\u4e2d...' : group.isIgnored ? '\u53d6\u6d88\u5ffd\u7565' : '\u5ffd\u7565'}
                         </button>
                       </div>
                     </div>

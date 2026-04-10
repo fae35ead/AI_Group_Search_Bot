@@ -48,7 +48,9 @@ SCHEMA_STATEMENTS = (
     entry_url TEXT,
     image_path TEXT,
     fallback_url TEXT,
-    viewed_at TEXT NOT NULL
+    viewed_at TEXT NOT NULL,
+    is_joined INTEGER NOT NULL DEFAULT 0,
+    is_ignored INTEGER NOT NULL DEFAULT 0
   )
   ''',
   '''
@@ -79,6 +81,16 @@ SCHEMA_STATEMENTS = (
   ''',
 )
 
+POST_SCHEMA_MIGRATIONS = (
+  ('viewed_groups', 'is_joined', 'ALTER TABLE viewed_groups ADD COLUMN is_joined INTEGER NOT NULL DEFAULT 0'),
+  ('viewed_groups', 'is_ignored', 'ALTER TABLE viewed_groups ADD COLUMN is_ignored INTEGER NOT NULL DEFAULT 0'),
+)
+
+
+def _has_column(connection: sqlite3.Connection, table_name: str, column_name: str) -> bool:
+  rows = connection.execute(f'PRAGMA table_info({table_name})').fetchall()
+  return any(str(row[1]) == column_name for row in rows)
+
 
 def initialize_database(database_path: Path) -> None:
   database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -89,6 +101,10 @@ def initialize_database(database_path: Path) -> None:
 
     for statement in SCHEMA_STATEMENTS:
       connection.execute(statement)
+
+    for table_name, column_name, statement in POST_SCHEMA_MIGRATIONS:
+      if not _has_column(connection, table_name, column_name):
+        connection.execute(statement)
 
     connection.commit()
 

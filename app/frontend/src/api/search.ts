@@ -71,6 +71,9 @@ interface SearchResponseDto {
   query: string
   results: ProductCardDto[]
   empty_message: string | null
+  job_id?: string | null
+  job_status?: 'pending' | 'running' | 'completed' | 'failed' | null
+  is_partial?: boolean
 }
 
 interface ViewedGroupDto {
@@ -82,6 +85,7 @@ interface ViewedGroupDto {
   entry: GroupEntryDto
   viewed_at: string
   is_joined: boolean
+  is_ignored: boolean
 }
 
 interface ViewedGroupsResponseDto {
@@ -92,6 +96,7 @@ interface MarkViewedGroupRequestDto {
   product_id: string
   app_name: string
   group: OfficialGroupDto
+  is_ignored?: boolean
 }
 
 interface RecommendedToolDto {
@@ -150,6 +155,9 @@ export interface SearchResponse {
   query: string
   results: ProductCard[]
   emptyMessage: string | null
+  jobId?: string
+  jobStatus?: 'pending' | 'running' | 'completed' | 'failed'
+  isPartial: boolean
 }
 
 interface SearchOptions {
@@ -188,6 +196,28 @@ export async function searchOfficialGroups(
     query: payload.query,
     results: payload.results.map(mapProductCard),
     emptyMessage: payload.empty_message,
+    jobId: payload.job_id ?? undefined,
+    jobStatus: payload.job_status ?? undefined,
+    isPartial: payload.is_partial ?? false,
+  }
+}
+
+export async function fetchSearchJob(jobId: string): Promise<SearchResponse> {
+  const response = await fetch(`/api/search/jobs/${encodeURIComponent(jobId)}`, {
+    headers: { Accept: 'application/json' },
+  })
+  if (!response.ok) {
+    throw new Error(`Fetch search job failed with status ${response.status}`)
+  }
+
+  const payload = (await response.json()) as SearchResponseDto
+  return {
+    query: payload.query,
+    results: payload.results.map(mapProductCard),
+    emptyMessage: payload.empty_message,
+    jobId: payload.job_id ?? undefined,
+    jobStatus: payload.job_status ?? undefined,
+    isPartial: payload.is_partial ?? false,
   }
 }
 
@@ -207,10 +237,15 @@ export async function fetchViewedGroups(): Promise<ViewedGroup[]> {
     entry: mapEntry(group.entry),
     viewedAt: group.viewed_at,
     isJoined: group.is_joined ?? false,
+    isIgnored: group.is_ignored ?? false,
   }))
 }
 
-export async function markGroupViewed(product: ProductCard, group: OfficialGroup): Promise<void> {
+export async function markGroupViewed(
+  product: ProductCard,
+  group: OfficialGroup,
+  options?: { isIgnored?: boolean },
+): Promise<void> {
   const requestPayload: MarkViewedGroupRequestDto = {
     product_id: product.productId,
     app_name: product.appName,
@@ -222,6 +257,7 @@ export async function markGroupViewed(product: ProductCard, group: OfficialGroup
       is_added: group.isAdded,
       source_urls: group.sourceUrls,
     },
+    is_ignored: options?.isIgnored ?? false,
   }
 
   const response = await fetch('/api/groups/viewed', {
@@ -261,11 +297,23 @@ export async function toggleGroupJoined(viewKey: string): Promise<{ isJoined: bo
   return { isJoined: payload.is_joined }
 }
 
+export async function toggleGroupIgnored(viewKey: string): Promise<{ isIgnored: boolean }> {
+  const response = await fetch(`/api/groups/viewed/${encodeURIComponent(viewKey)}/ignored`, {
+    method: 'PATCH',
+    headers: { Accept: 'application/json' },
+  })
+  if (!response.ok) {
+    throw new Error(`Toggle ignored failed with status ${response.status}`)
+  }
+  const payload = (await response.json()) as { ok: true; is_ignored: boolean }
+  return { isIgnored: payload.is_ignored }
+}
+
 export async function bulkMarkGroupsViewed(
-  items: Array<{ card: ProductCard; group: OfficialGroup }>,
+  items: Array<{ card: ProductCard; group: OfficialGroup; isIgnored?: boolean }>,
 ): Promise<void> {
   const requestPayload = {
-    items: items.map(({ card, group }) => ({
+    items: items.map(({ card, group, isIgnored }) => ({
       product_id: card.productId,
       app_name: card.appName,
       group: {
@@ -276,6 +324,7 @@ export async function bulkMarkGroupsViewed(
         is_added: group.isAdded,
         source_urls: group.sourceUrls,
       },
+      is_ignored: isIgnored ?? false,
     })),
   }
   const response = await fetch('/api/groups/viewed/bulk', {

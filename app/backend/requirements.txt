@@ -6,3 +6,4 @@ playwright==1.55.0
 opencv-python==4.12.0.88
 slowapi==0.1.9
 python-multipart==0.0.5
+python-dotenv==1.1.1

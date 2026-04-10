@@ -1,7 +1,7 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { fetchHealth, type HealthPayload } from './api/health'
-import { bulkMarkGroupsViewed, fetchRecommendations, fetchViewedGroups, manualUploadGroup, markGroupViewed, removeViewedGroup, searchOfficialGroups, toggleGroupJoined } from './api/search'
+import { bulkMarkGroupsViewed, fetchRecommendations, fetchSearchJob, fetchViewedGroups, manualUploadGroup, markGroupViewed, removeViewedGroup, searchOfficialGroups, toggleGroupJoined, toggleGroupIgnored } from './api/search'
 import { ResultCard } from './components/ResultCard'
 import { ViewedLibrary } from './components/ViewedLibrary'
 import { canonicalizePlatform } from './domain/platform'
@@ -67,6 +67,7 @@ function readViewedGroupsFromStorage(): ViewedGroup[] {
         ...item,
         platform: canonicalizePlatform(item.platform as Platform | '企业微信'),
         isJoined: item.isJoined ?? false,
+        isIgnored: item.isIgnored ?? false,
       }))
   } catch {
     return []
@@ -97,7 +98,8 @@ type ManualUploadFormState = {
   qrcodeFile: File | null
 }
 
-type SearchMode = 'initial' | 'expand' | 'verify'
+type SearchMode = 'initial' | 'verify'
+const SEARCH_JOB_POLL_MS = 1200
 
 const PLATFORM_OPTIONS: Array<{ label: string; value: Platform }> = [
   { label: '微信', value: '\u5fae\u4fe1' },
@@ -141,6 +143,8 @@ function App() {
   const [query, setQuery] = useState('')
   const [rawResults, setRawResults] = useState<ProductCard[]>([])
   const [searchMode, setSearchMode] = useState<SearchMode | null>(null)
+  const [searchJobId, setSearchJobId] = useState<string | null>(null)
+  const [searchJobRunning, setSearchJobRunning] = useState(false)
   const [emptyMessage, setEmptyMessage] = useState<string | null>(null)
   const [searchError, setSearchError] = useState<string | null>(null)
   const [health, setHealth] = useState<HealthPayload | null>(null)
@@ -157,6 +161,7 @@ function App() {
   const [markingGroupIds, setMarkingGroupIds] = useState<string[]>([])
   const [removingViewedKeys, setRemovingViewedKeys] = useState<string[]>([])
   const [togglingJoinedKeys, setTogglingJoinedKeys] = useState<string[]>([])
+  const [togglingIgnoredKeys, setTogglingIgnoredKeys] = useState<string[]>([])
   const [expandedResultCards, setExpandedResultCards] = useState<string[]>([])
   const [loadingViewed, setLoadingViewed] = useState(false)
   const [autoMode, setAutoMode] = useState(false)
@@ -169,10 +174,8 @@ function App() {
   const [manualForm, setManualForm] = useState<ManualUploadFormState>(INITIAL_MANUAL_FORM)
   const [submittedQuery, setSubmittedQuery] = useState('')
   const activeSearchControllerRef = useRef<AbortController | null>(null)
-  const activeSearchRequestRef = useRef<{ query: string; limit: number; mode: SearchMode } | null>(null)
-  const lastCompletedSearchRef = useRef<{ query: string; limit: number } | null>(null)
 
-  const loading = searchMode === 'initial' || searchMode === 'expand'
+  const loading = searchMode === 'initial'
   const verifying = searchMode === 'verify'
   const showInitialSkeleton = searchMode === 'initial'
 
@@ -238,7 +241,8 @@ function App() {
     activeSearchControllerRef.current?.abort()
     const controller = new AbortController()
     activeSearchControllerRef.current = controller
-    activeSearchRequestRef.current = { query: trimmedQuery, limit: requestedLimit, mode }
+    setSearchJobId(null)
+    setSearchJobRunning(false)
 
     setSearchError(null)
     setSearchMode(mode)
@@ -249,7 +253,6 @@ function App() {
       setQuery(trimmedQuery)
     }
 
-    let aborted = false
     try {
       const response = await searchOfficialGroups(trimmedQuery, buildFilters(), {
         refresh: mode === 'verify',
@@ -259,29 +262,28 @@ function App() {
       const unique = Array.from(new Map(response.results.map((card) => [card.productId, card])).values())
       setRawResults(unique)
       setEmptyMessage(response.emptyMessage)
+      setSearchJobId(response.jobId ?? null)
+      setSearchJobRunning(Boolean(response.isPartial && response.jobId))
     } catch (error) {
       if (isAbortError(error)) {
-        aborted = true
         return
       }
+      setSearchJobId(null)
+      setSearchJobRunning(false)
       if (mode === 'initial') {
         setRawResults([])
         setEmptyMessage(null)
-        setSearchError(
-          error instanceof Error
-            ? '搜索请求失败，请确认本地后端已启动后再试。'
-            : '搜索请求失败，请稍后重试。',
-        )
       }
+      setSearchError(
+        error instanceof Error
+          ? '搜索请求失败，请确认本地后端已启动后再试。'
+          : '搜索请求失败，请稍后重试。',
+      )
     } finally {
       const isLatest = activeSearchControllerRef.current === controller
       if (isLatest) {
         activeSearchControllerRef.current = null
-        activeSearchRequestRef.current = null
         setSearchMode(null)
-        if (!aborted && mode !== 'verify') {
-          lastCompletedSearchRef.current = { query: trimmedQuery, limit: requestedLimit }
-        }
       }
     }
   }, [buildFilters, resultLimit])
@@ -349,45 +351,58 @@ function App() {
   }, [viewedGroups])
 
   useEffect(() => {
-    const activeRequest = activeSearchRequestRef.current
-    if (!activeRequest || activeRequest.mode !== 'expand') {
-      return
-    }
-    if (resultLimit >= activeRequest.limit) {
-      return
-    }
-    activeSearchControllerRef.current?.abort()
-  }, [resultLimit])
-
-  useEffect(() => {
-    const trimmedSubmittedQuery = submittedQuery.trim()
-    if (!trimmedSubmittedQuery || searchMode !== null) {
-      return
-    }
-    if (resultLimit <= rawResults.length) {
+    if (!searchJobId || !searchJobRunning) {
       return
     }
 
-    const lastCompletedSearch = lastCompletedSearchRef.current
-    if (!lastCompletedSearch || lastCompletedSearch.query !== trimmedSubmittedQuery) {
-      return
-    }
-    if (lastCompletedSearch.limit >= resultLimit) {
-      return
+    let cancelled = false
+    let timer: number | undefined
+
+    const poll = async () => {
+      try {
+        const response = await fetchSearchJob(searchJobId)
+        if (cancelled) {
+          return
+        }
+
+        const unique = Array.from(new Map(response.results.map((card) => [card.productId, card])).values())
+        setRawResults(unique)
+        setEmptyMessage(response.emptyMessage)
+
+        if (response.isPartial) {
+          timer = window.setTimeout(() => {
+            void poll()
+          }, SEARCH_JOB_POLL_MS)
+          return
+        }
+
+        setSearchJobId(response.jobId ?? null)
+        setSearchJobRunning(false)
+      } catch {
+        if (cancelled) {
+          return
+        }
+        setSearchJobId(null)
+        setSearchJobRunning(false)
+      }
     }
 
-    const timer = window.setTimeout(() => {
-      void runSearch(trimmedSubmittedQuery, 'expand', resultLimit)
-    }, 400)
+    timer = window.setTimeout(() => {
+      void poll()
+    }, SEARCH_JOB_POLL_MS)
 
-    return () => window.clearTimeout(timer)
-  }, [rawResults.length, resultLimit, runSearch, searchMode, submittedQuery])
+    return () => {
+      cancelled = true
+      if (typeof timer === 'number') {
+        window.clearTimeout(timer)
+      }
+    }
+  }, [searchJobId, searchJobRunning])
 
   useEffect(() => {
     return () => {
       activeSearchControllerRef.current?.abort()
       activeSearchControllerRef.current = null
-      activeSearchRequestRef.current = null
     }
   }, [])
 
@@ -400,6 +415,8 @@ function App() {
       setSearchError('请输入 AI 工具名、关键词、官网域名或 GitHub 仓库。')
       setEmptyMessage(null)
       setRawResults([])
+      setSearchJobId(null)
+      setSearchJobRunning(false)
       return
     }
 
@@ -421,6 +438,36 @@ function App() {
     setMarkingGroupIds((prev) => [...prev, group.groupId])
     try {
       await markGroupViewed(card, group)
+      setRawResults((prev) =>
+        prev
+          .map((item) => {
+            if (item.productId !== card.productId) {
+              return item
+            }
+            return {
+              ...item,
+              groups: item.groups.filter((entry) => entry.groupId !== group.groupId),
+            }
+          })
+          .filter((item) => item.groups.length > 0),
+      )
+      setViewedExpanded(true)
+      await loadViewedList()
+    } catch {
+      // Keep current UI on mark failure.
+    } finally {
+      setMarkingGroupIds((prev) => prev.filter((id) => id !== group.groupId))
+    }
+  }
+
+  async function handleMarkIgnored(card: ProductCard, group: OfficialGroup) {
+    if (markingGroupIds.includes(group.groupId)) {
+      return
+    }
+
+    setMarkingGroupIds((prev) => [...prev, group.groupId])
+    try {
+      await markGroupViewed(card, group, { isIgnored: true })
       setRawResults((prev) =>
         prev
           .map((item) => {
@@ -476,6 +523,42 @@ function App() {
     }
   }
 
+  async function handleToggleIgnored(viewKey: string) {
+    if (togglingIgnoredKeys.includes(viewKey)) {
+      return
+    }
+    setTogglingIgnoredKeys((prev) => [...prev, viewKey])
+    try {
+      const { isIgnored } = await toggleGroupIgnored(viewKey)
+      const updated = viewedGroups.map((g) => (g.viewKey === viewKey ? { ...g, isIgnored } : g))
+      setViewedGroups(updated)
+      persistViewedGroupsToStorage(updated)
+    } catch {
+      // Keep current UI on toggle failure.
+    } finally {
+      setTogglingIgnoredKeys((prev) => prev.filter((k) => k !== viewKey))
+    }
+  }
+
+  async function waitForSearchJobResults(jobId: string, initialResults: ProductCard[]): Promise<ProductCard[]> {
+    let latestResults = initialResults
+
+    while (autoModeRef.current) {
+      await new Promise((resolve) => window.setTimeout(resolve, SEARCH_JOB_POLL_MS))
+
+      const response = await fetchSearchJob(jobId)
+      latestResults = Array.from(new Map(response.results.map((card) => [card.productId, card])).values())
+      setRawResults(latestResults)
+      setEmptyMessage(response.emptyMessage)
+
+      if (!response.isPartial) {
+        return latestResults
+      }
+    }
+
+    return latestResults
+  }
+
   async function startAutoMode() {
     const keywords = recommendations.map((r) => r.name).filter(Boolean)
     if (keywords.length === 0) {
@@ -485,6 +568,8 @@ function App() {
     autoModeRef.current = true
     setAutoMode(true)
     setAutoPending(null)
+    setSearchJobId(null)
+    setSearchJobRunning(false)
     await runAutoRound(shuffled, 0)
   }
 
@@ -494,6 +579,8 @@ function App() {
     setAutoPending(null)
     setAutoQueue([])
     setSearchMode(null)
+    setSearchJobId(null)
+    setSearchJobRunning(false)
   }
 
   async function runAutoRound(queue: string[], index: number) {
@@ -517,6 +604,9 @@ function App() {
       results = Array.from(new Map(response.results.map((card) => [card.productId, card])).values())
       setRawResults(results)
       setEmptyMessage(response.emptyMessage)
+      if (response.isPartial && response.jobId) {
+        results = await waitForSearchJobResults(response.jobId, results)
+      }
     } catch {
       // Skip to next keyword on error.
       setSearchMode(null)
@@ -859,6 +949,7 @@ function App() {
                 <p className="search-helper-copy">
                   {'支持：AI 工具名 / 关键词 / 官网域名 / GitHub 仓库。结果：可调返回数量（3-50），筛选即时生效。'}
                 </p>
+                {searchJobRunning ? <p className="status-note">{'正在后台补充更多搜索结果…'}</p> : null}
               </div>
 
               {manualUploadOpen ? (
@@ -1028,8 +1119,10 @@ function App() {
                 groups={viewedGroups}
                 removingKeys={removingViewedKeys}
                 togglingJoinedKeys={togglingJoinedKeys}
+                togglingIgnoredKeys={togglingIgnoredKeys}
                 onRemove={(viewKey) => void handleRemoveViewed(viewKey)}
                 onToggleJoined={(viewKey) => void handleToggleJoined(viewKey)}
+                onToggleIgnored={(viewKey) => void handleToggleIgnored(viewKey)}
                 onCopyQQNumber={(qqNumber) => void handleCopyQQNumber(qqNumber)}
               />
             )
@@ -1116,6 +1209,7 @@ function App() {
                   markingGroupIds={markingGroupIds}
                   onCopyQQNumber={(qqNumber) => void handleCopyQQNumber(qqNumber)}
                   onMarkViewed={(currentCard, group) => void handleMarkViewed(currentCard, group)}
+                  onMarkIgnored={(currentCard, group) => void handleMarkIgnored(currentCard, group)}
                   onToggleExpanded={toggleResultCard}
                 />
               ))}

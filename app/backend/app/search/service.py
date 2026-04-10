@@ -1,11 +1,15 @@
+from _thread import LockType
 import base64
 import csv
+from dataclasses import dataclass, field
 import hashlib
 import json
 import logging
 import random
 import re
 import shutil
+import time
+import uuid
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -27,6 +31,7 @@ from app.api.schemas import (
   RecommendedTool,
   RecommendationsResponse,
   SearchFilters,
+  SearchJobStatus,
   ViewedGroupItem,
 )
 from app.core.config import Settings
@@ -42,8 +47,52 @@ from app.search.models import (
 
 logger = logging.getLogger(__name__)
 
+
+@dataclass(slots=True)
+class SearchJob:
+  job_id: str
+  query: str
+  filters: SearchFilters | None
+  status: SearchJobStatus
+  refresh: bool = False
+  prepared_target_limit: int = 0
+  cache_key: str | None = None
+  remaining_candidates: list[GitHubRepositoryCandidate] = field(default_factory=list)
+  raw_results: list[ProductCard] = field(default_factory=list)
+  results: list[ProductCard] = field(default_factory=list)
+  empty_message: str | None = None
+  error: str | None = None
+  created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+  updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass(slots=True)
+class PreparedSearch:
+  cache_key: str
+  cached_results: list[ProductCard]
+  merged_candidates: list[GitHubRepositoryCandidate]
+
+
+@dataclass(frozen=True, slots=True)
+class ViewedGroupFilters:
+  viewed_ids: frozenset[str] = frozenset()
+  viewed_match_keys: frozenset[str] = frozenset()
+
+
+@dataclass(slots=True)
+class CandidateFetchResult:
+  pages: list[FetchedPage] = field(default_factory=list)
+  seed_extracted_groups: list[ExtractedGroupCandidate] = field(default_factory=list)
+  seed_has_groups: bool = False
+  seed_page_count: int = 0
+
 MAX_RESULTS_DEFAULT = 10
 MAX_RESULTS_HARD_LIMIT = 50
+INITIAL_SYNC_RESULT_LIMIT = 10
+SEARCH_JOB_TARGET_LIMIT = MAX_RESULTS_HARD_LIMIT
+SEARCH_JOB_HISTORY_LIMIT = 24
+SEARCH_JOB_MAX_WORKERS = 2
+SEARCH_JOB_BATCH_SIZE = 4
 MAX_GROUPS_PER_CARD = 10
 MAX_GITHUB_DEEP_CANDIDATES = 10
 MAX_GITHUB_SEARCH_CANDIDATES = 20
@@ -63,6 +112,12 @@ GITHUB_VARIANT_MAX_WORKERS = 4
 GITHUB_SEARCH_TIMEOUT = 10.0
 PAGE_FETCH_TIMEOUT = 8.0
 WEB_SEARCH_TIMEOUT = 8.0
+GITHUB_PRIMARY_CONFIDENCE_SCORE = 170
+GITHUB_STRONG_CONFIDENCE_SCORE = 220
+GITHUB_PRIMARY_EARLY_STOP_MAX_CANDIDATES = 6
+CRAWL_CONFIDENT_PRIMARY_COUNT = 4
+RELATED_EXPANSION_CONFIDENCE_TARGET = 5
+WEB_FALLBACK_CONFIDENT_CANDIDATE_COUNT = 5
 MAX_OFFICIAL_BROWSER_FALLBACK_CANDIDATES = 3
 MAX_WEB_OFFICIAL_BROWSER_FALLBACK_CANDIDATES = 2
 BROWSER_FETCH_TIMEOUT_MS = 20_000
@@ -71,6 +126,7 @@ MAX_BROWSER_EXTRA_VISUAL_SOURCES = 10
 MAX_BROWSER_EXTRA_DATA_URL_CHARS = 900_000
 MAX_BROWSER_VISUAL_SCAN_ELEMENTS = 1200
 SEARCH_CACHE_TTL_SECONDS = 24 * 60 * 60
+SEARCH_EMPTY_MESSAGE = '\u672a\u5728 GitHub/\u5b98\u7f51\u76f8\u5173\u9875\u9762\u4e2d\u53d1\u73b0\u5b98\u65b9\u7fa4\u5165\u53e3'
 CJK_PATTERN = re.compile(r'[\u3400-\u9fff]')
 MAX_GITHUB_SEARCH_PER_PAGE = 50
 LEGACY_QRCODE_FILENAME_PATTERN = re.compile(r'^[0-9a-f]{40}\.(png|jpg|jpeg|svg)$', re.IGNORECASE)
@@ -228,6 +284,43 @@ NOISY_RELATED_GITHUB_PATH_PREFIXES = (
   '/topics/',
 )
 
+DISCOVERY_SIGNAL_KEYWORDS = (
+  'community',
+  'discord',
+  'qq',
+  'wechat',
+  'weixin',
+  'feishu',
+  'lark',
+  'group',
+  'join',
+  'invite',
+  'support',
+  'contact',
+  '二维码',
+  '社群',
+  '社区',
+  '官方群',
+  '交流群',
+  '加群',
+  '入群',
+  '飞书',
+  '微信',
+)
+LOW_VALUE_RELATED_PATH_HINTS = (
+  '/docs',
+  '/doc',
+  '/documentation',
+  '/blog',
+  '/changelog',
+  '/release',
+  '/releases',
+  '/download',
+  '/pricing',
+  '/terms',
+  '/privacy',
+)
+
 
 class SearchService:
   _recommendations_cache: tuple[list[RecommendedTool], datetime] | None = None
@@ -241,9 +334,64 @@ class SearchService:
       follow_redirects=True,
       timeout=PAGE_FETCH_TIMEOUT,
     )
+    self._job_executor: ThreadPoolExecutor | None = ThreadPoolExecutor(max_workers=SEARCH_JOB_MAX_WORKERS)
+    self._job_lock = Lock()
+    self._jobs: dict[str, SearchJob] = {}
+    self._browser_executor_lock = Lock()
+    self._browser_executor: ThreadPoolExecutor | None = ThreadPoolExecutor(max_workers=1)
+    self._playwright = None
+    self._browser = None
+    self._browser_context = None
 
   def __del__(self):
-    self._page_client.close()
+    self.close()
+
+  def close(self) -> None:
+    try:
+      self._page_client.close()
+    except Exception:
+      pass
+
+    if self._job_executor is not None:
+      try:
+        self._job_executor.shutdown(wait=True, cancel_futures=False)
+      except Exception:
+        pass
+      self._job_executor = None
+
+    self._shutdown_browser_executor()
+
+  def _ensure_job_executor(self) -> ThreadPoolExecutor:
+    if self._job_executor is None:
+      self._job_executor = ThreadPoolExecutor(max_workers=SEARCH_JOB_MAX_WORKERS)
+    return self._job_executor
+
+  def _ensure_browser_executor(self) -> ThreadPoolExecutor:
+    with self._browser_executor_lock:
+      if self._browser_executor is None:
+        self._browser_executor = ThreadPoolExecutor(max_workers=1)
+      return self._browser_executor
+
+  def _shutdown_browser_executor(self) -> None:
+    with self._browser_executor_lock:
+      executor = self._browser_executor
+      self._browser_executor = None
+
+    if executor is None:
+      return
+
+    try:
+      executor.submit(self._close_browser_worker).result(timeout=10)
+    except RuntimeError:
+      pass
+    except Exception:
+      # Best effort during shutdown.
+      pass
+    finally:
+      try:
+        executor.shutdown(wait=True, cancel_futures=False)
+      except Exception:
+        pass
 
   def _debug_log(self, message: str, *args: object) -> None:
     if self.settings.search_debug_enabled:
@@ -257,20 +405,158 @@ class SearchService:
     refresh: bool = False,
     limit: int = MAX_RESULTS_DEFAULT,
   ) -> list[ProductCard]:
+    """Deprecated compatibility wrapper around search_with_job()."""
     normalized_query = self._normalize_query(query)
     if not normalized_query:
       return []
     normalized_limit = self._normalize_result_limit(limit)
+    results, job_id, _job_status, is_partial = self.search_with_job(
+      normalized_query,
+      filters,
+      refresh=refresh,
+      limit=normalized_limit,
+      target_limit=normalized_limit,
+      initial_sync_limit=normalized_limit,
+      allow_background_job=False,
+    )
+    while is_partial and job_id is not None:
+      time.sleep(0.1)
+      job = self.get_search_job(job_id)
+      if job is None:
+        break
+      results = job.results
+      is_partial = job.status in {SearchJobStatus.PENDING, SearchJobStatus.RUNNING}
+    return results[:normalized_limit]
 
+  def search_with_job(
+    self,
+    query: str,
+    filters: SearchFilters | None = None,
+    *,
+    refresh: bool = False,
+    limit: int = MAX_RESULTS_DEFAULT,
+    target_limit: int | None = None,
+    initial_sync_limit: int | None = None,
+    allow_background_job: bool = True,
+  ) -> tuple[list[ProductCard], str | None, SearchJobStatus | None, bool]:
+    normalized_query = self._normalize_query(query)
+    if not normalized_query:
+      return [], None, None, False
+
+    normalized_limit = self._normalize_result_limit(limit)
+    effective_target_limit = self._normalize_result_limit(target_limit or normalized_limit)
+    initial_target = min(initial_sync_limit or INITIAL_SYNC_RESULT_LIMIT, effective_target_limit)
+    viewed_filters = self._load_viewed_group_filters()
+    prepared = self._prepare_search(
+      normalized_query,
+      filters,
+      refresh=refresh,
+      target_limit=effective_target_limit,
+    )
+
+    if len(prepared.cached_results) >= SEARCH_JOB_TARGET_LIMIT:
+      filtered_cached = self._filter_viewed_cards(prepared.cached_results, viewed_filters=viewed_filters)
+      return filtered_cached, None, SearchJobStatus.COMPLETED, False
+
+    base_results = prepared.cached_results[:SEARCH_JOB_TARGET_LIMIT]
+    exclude_product_ids = {card.product_id for card in base_results}
+    remaining_candidates = [
+      candidate
+      for candidate in prepared.merged_candidates
+      if self._candidate_product_id(candidate) not in exclude_product_ids
+    ]
+    sync_target = max(0, initial_target - len(base_results))
+
+    initial_results = base_results
+    if sync_target > 0 and remaining_candidates:
+      sync_cards = self._collect_cards(
+        remaining_candidates,
+        max_cards=sync_target,
+        exclude_product_ids=exclude_product_ids,
+      )[:sync_target]
+      initial_results = self._merge_product_cards(base_results, sync_cards, max_cards=SEARCH_JOB_TARGET_LIMIT)
+      exclude_product_ids = {card.product_id for card in initial_results}
+      remaining_candidates = [
+        candidate
+        for candidate in remaining_candidates
+        if self._candidate_product_id(candidate) not in exclude_product_ids
+      ]
+
+    filtered_initial = self._filter_viewed_cards(initial_results, viewed_filters=viewed_filters)
+    self._debug_log(
+      'query=%r initial_results=%d remaining_candidates=%d initial_target=%d target_limit=%d allow_background_job=%s',
+      normalized_query,
+      len(initial_results),
+      len(remaining_candidates),
+      initial_target,
+      effective_target_limit,
+      allow_background_job,
+    )
+
+    if not allow_background_job or (not remaining_candidates and not initial_results) or (
+      not remaining_candidates and len(initial_results) >= effective_target_limit
+    ) or len(initial_results) >= SEARCH_JOB_TARGET_LIMIT:
+      if initial_results:
+        self._save_cached_search(prepared.cache_key, initial_results)
+      return filtered_initial, None, SearchJobStatus.COMPLETED, False
+
+    job = self._create_search_job(
+      query=normalized_query,
+      filters=filters,
+      refresh=refresh,
+      prepared_target_limit=effective_target_limit,
+      cache_key=prepared.cache_key,
+      remaining_candidates=remaining_candidates,
+      raw_results=initial_results,
+      results=filtered_initial,
+    )
+    self._ensure_job_executor().submit(self._run_search_job, job.job_id)
+    return filtered_initial, job.job_id, job.status, True
+
+  def get_search_job(self, job_id: str) -> SearchJob | None:
+    with self._job_lock:
+      job = self._jobs.get(job_id)
+      if job is None:
+        return None
+
+      return SearchJob(
+        job_id=job.job_id,
+        query=job.query,
+        filters=job.filters,
+        status=job.status,
+        refresh=job.refresh,
+        prepared_target_limit=job.prepared_target_limit,
+        cache_key=job.cache_key,
+        remaining_candidates=job.remaining_candidates[:],
+        raw_results=job.raw_results[:],
+        results=job.results[:],
+        empty_message=job.empty_message,
+        error=job.error,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+      )
+
+  def _prepare_search(
+    self,
+    normalized_query: str,
+    filters: SearchFilters | None,
+    *,
+    refresh: bool,
+    target_limit: int,
+  ) -> PreparedSearch:
     cache_key = self._build_search_cache_key(normalized_query, filters)
     cached_results: list[ProductCard] = []
     if not refresh:
-      cached_results = self._load_cached_search(cache_key) or []
-      if len(cached_results) >= normalized_limit:
-        return self._filter_viewed_cards(cached_results)[:normalized_limit]
+      cached_results = (self._load_cached_search(cache_key) or [])[:SEARCH_JOB_TARGET_LIMIT]
+      if len(cached_results) >= target_limit:
+        return PreparedSearch(
+          cache_key=cache_key,
+          cached_results=cached_results,
+          merged_candidates=[],
+        )
 
     try:
-      github_candidate_limit = self._resolve_github_search_limit(normalized_limit)
+      github_candidate_limit = self._resolve_github_search_limit(target_limit)
       github_candidates = self._github_search(
         normalized_query,
         limit=github_candidate_limit,
@@ -286,14 +572,18 @@ class SearchService:
       logger.error('GitHub search failed: %s', exc)
       github_candidates = []
 
-    deep_candidate_limit = self._resolve_github_deep_candidate_limit(normalized_limit)
+    deep_candidate_limit = self._resolve_github_deep_candidate_limit(target_limit)
     crawl_candidates = self._build_crawl_candidates(
       normalized_query,
       github_candidates,
       target_count=deep_candidate_limit,
     )
-
-    fallback_candidates = self._build_web_fallback_candidates(normalized_query)
+    include_web_fallback = self._should_include_web_fallback(
+      normalized_query,
+      crawl_candidates,
+      target_count=deep_candidate_limit,
+    )
+    fallback_candidates = self._build_web_fallback_candidates(normalized_query) if include_web_fallback else []
     existing_keys = {self._candidate_key(candidate) for candidate in crawl_candidates}
     filtered_fallback = [
       candidate
@@ -304,48 +594,170 @@ class SearchService:
       key=lambda candidate: self._web_fallback_candidate_sort_key(normalized_query, candidate),
       reverse=True,
     )
-
     merged_candidates = crawl_candidates + filtered_fallback
     self._debug_log(
-      'query=%r crawl_candidates=%d fallback_candidates=%d merged_candidates=%d',
+      'query=%r crawl_candidates=%d fallback_candidates=%d merged_candidates=%d include_web_fallback=%s',
       normalized_query,
       len(crawl_candidates),
       len(filtered_fallback),
       len(merged_candidates),
+      include_web_fallback,
     )
-    if not merged_candidates:
-      if cached_results:
-        return self._filter_viewed_cards(cached_results)[:normalized_limit]
-      return []
-
-    base_results: list[ProductCard] = []
-    exclude_product_ids: set[str] = set()
-    target_collect_count = normalized_limit
-    if not refresh and cached_results:
-      base_results = cached_results[:MAX_RESULTS_HARD_LIMIT]
-      exclude_product_ids = {card.product_id for card in base_results}
-      target_collect_count = max(0, normalized_limit - len(base_results))
-
-    fresh_cards: list[ProductCard] = []
-    if target_collect_count > 0:
-      fresh_cards = self._collect_cards(
-        merged_candidates,
-        max_cards=target_collect_count,
-        exclude_product_ids=exclude_product_ids,
-      )[:target_collect_count]
-
-    final_cards = self._merge_product_cards(base_results, fresh_cards, max_cards=MAX_RESULTS_HARD_LIMIT)
-    if final_cards:
-      self._save_cached_search(cache_key, final_cards)
-    filtered_cards = self._filter_viewed_cards(final_cards)
-    self._debug_log(
-      'query=%r final_cards=%d filtered_cards=%d return_limit=%d',
-      normalized_query,
-      len(final_cards),
-      len(filtered_cards),
-      normalized_limit,
+    return PreparedSearch(
+      cache_key=cache_key,
+      cached_results=cached_results,
+      merged_candidates=merged_candidates,
     )
-    return filtered_cards[:normalized_limit]
+
+  def _create_search_job(
+    self,
+    *,
+    query: str,
+    filters: SearchFilters | None,
+    refresh: bool,
+    prepared_target_limit: int,
+    cache_key: str,
+    remaining_candidates: list[GitHubRepositoryCandidate],
+    raw_results: list[ProductCard],
+    results: list[ProductCard],
+  ) -> SearchJob:
+    now = datetime.now(timezone.utc)
+    job = SearchJob(
+      job_id=uuid.uuid4().hex,
+      query=query,
+      filters=filters,
+      status=SearchJobStatus.PENDING,
+      refresh=refresh,
+      prepared_target_limit=prepared_target_limit,
+      cache_key=cache_key,
+      remaining_candidates=remaining_candidates[:],
+      raw_results=raw_results[:],
+      results=results[:],
+      created_at=now,
+      updated_at=now,
+    )
+    with self._job_lock:
+      self._jobs[job.job_id] = job
+      self._trim_search_jobs_locked()
+    return job
+
+  def _trim_search_jobs_locked(self) -> None:
+    if len(self._jobs) <= SEARCH_JOB_HISTORY_LIMIT:
+      return
+
+    ordered_jobs = sorted(self._jobs.values(), key=lambda item: item.updated_at)
+    overflow = len(self._jobs) - SEARCH_JOB_HISTORY_LIMIT
+    for item in ordered_jobs[:overflow]:
+      self._jobs.pop(item.job_id, None)
+
+  def _run_search_job(
+    self,
+    job_id: str,
+  ) -> None:
+    with self._job_lock:
+      job = self._jobs.get(job_id)
+      if job is None:
+        return
+      job.status = SearchJobStatus.RUNNING
+      job.updated_at = datetime.now(timezone.utc)
+      raw_results = job.raw_results[:]
+      query = job.query
+      filters = job.filters
+      refresh = job.refresh
+      prepared_target_limit = job.prepared_target_limit
+      remaining_candidates = job.remaining_candidates[:]
+
+    viewed_filters = self._load_viewed_group_filters()
+    exclude_product_ids = {card.product_id for card in raw_results}
+    try:
+      for batch_start in range(0, len(remaining_candidates), SEARCH_JOB_BATCH_SIZE):
+        remaining_capacity = SEARCH_JOB_TARGET_LIMIT - len(raw_results)
+        if remaining_capacity <= 0:
+          break
+
+        batch = remaining_candidates[batch_start:batch_start + SEARCH_JOB_BATCH_SIZE]
+        batch_cards = self._collect_cards(
+          batch,
+          max_cards=remaining_capacity,
+          exclude_product_ids=exclude_product_ids,
+        )[:remaining_capacity]
+        if not batch_cards:
+          continue
+
+        raw_results = self._merge_product_cards(raw_results, batch_cards, max_cards=SEARCH_JOB_TARGET_LIMIT)
+        exclude_product_ids = {card.product_id for card in raw_results}
+        filtered_results = self._filter_viewed_cards(raw_results, viewed_filters=viewed_filters)
+        with self._job_lock:
+          job = self._jobs.get(job_id)
+          if job is None:
+            return
+          job.raw_results = raw_results[:]
+          job.results = filtered_results[:]
+          job.updated_at = datetime.now(timezone.utc)
+
+      if len(raw_results) < SEARCH_JOB_TARGET_LIMIT and prepared_target_limit < SEARCH_JOB_TARGET_LIMIT:
+        prepared = self._prepare_search(
+          query,
+          filters,
+          refresh=refresh,
+          target_limit=SEARCH_JOB_TARGET_LIMIT,
+        )
+        refreshed_exclude_product_ids = {card.product_id for card in raw_results}
+        remaining_candidates = [
+          candidate
+          for candidate in prepared.merged_candidates
+          if self._candidate_product_id(candidate) not in refreshed_exclude_product_ids
+        ]
+        for batch_start in range(0, len(remaining_candidates), SEARCH_JOB_BATCH_SIZE):
+          remaining_capacity = SEARCH_JOB_TARGET_LIMIT - len(raw_results)
+          if remaining_capacity <= 0:
+            break
+
+          batch = remaining_candidates[batch_start:batch_start + SEARCH_JOB_BATCH_SIZE]
+          batch_cards = self._collect_cards(
+            batch,
+            max_cards=remaining_capacity,
+            exclude_product_ids=refreshed_exclude_product_ids,
+          )[:remaining_capacity]
+          if not batch_cards:
+            continue
+
+          raw_results = self._merge_product_cards(raw_results, batch_cards, max_cards=SEARCH_JOB_TARGET_LIMIT)
+          refreshed_exclude_product_ids = {card.product_id for card in raw_results}
+          filtered_results = self._filter_viewed_cards(raw_results, viewed_filters=viewed_filters)
+          with self._job_lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+              return
+            job.raw_results = raw_results[:]
+            job.results = filtered_results[:]
+            job.prepared_target_limit = SEARCH_JOB_TARGET_LIMIT
+            job.updated_at = datetime.now(timezone.utc)
+
+      filtered_results = self._filter_viewed_cards(raw_results, viewed_filters=viewed_filters)
+      with self._job_lock:
+        job = self._jobs.get(job_id)
+        if job is None:
+          return
+        job.raw_results = raw_results[:]
+        job.results = filtered_results[:]
+        job.remaining_candidates = []
+        job.status = SearchJobStatus.COMPLETED
+        job.empty_message = SEARCH_EMPTY_MESSAGE if not filtered_results else None
+        job.updated_at = datetime.now(timezone.utc)
+
+      if raw_results:
+        self._save_cached_search(job.cache_key or self._build_search_cache_key(job.query, job.filters), raw_results)
+    except Exception as exc:
+      logger.exception('Background search job failed: %s', exc)
+      with self._job_lock:
+        job = self._jobs.get(job_id)
+        if job is None:
+          return
+        job.status = SearchJobStatus.FAILED
+        job.error = str(exc)
+        job.empty_message = SEARCH_EMPTY_MESSAGE if not job.results else None
+        job.updated_at = datetime.now(timezone.utc)
 
   def _collect_cards(
     self,
@@ -376,7 +788,7 @@ class SearchService:
         break
 
       batch = filtered_candidates[batch_start:batch_start + batch_size]
-      pages_by_index: list[list[FetchedPage]] = [[] for _ in batch]
+      fetch_results_by_index: list[CandidateFetchResult] = [CandidateFetchResult() for _ in batch]
       max_workers = min(CANDIDATE_FETCH_MAX_WORKERS, len(batch))
       with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
@@ -390,17 +802,19 @@ class SearchService:
         ]
         for index, (candidate, future) in enumerate(zip(batch, futures)):
           try:
-            pages_by_index[index] = future.result()
+            fetch_results_by_index[index] = future.result()
           except Exception as exc:
             logger.warning('Failed to fetch candidate pages for %s: %s', candidate.repo_url or candidate.homepage, exc)
-            pages_by_index[index] = []
+            fetch_results_by_index[index] = CandidateFetchResult()
 
       for index, candidate in enumerate(batch):
         if len(cards) >= max_cards:
           break
-        pages = pages_by_index[index]
-
-        extracted = self.extractor.extract(pages) if pages else []
+        fetch_result = fetch_results_by_index[index]
+        pages = fetch_result.pages
+        extracted = list(fetch_result.seed_extracted_groups)
+        if not fetch_result.seed_has_groups and len(pages) > fetch_result.seed_page_count:
+          extracted.extend(self.extractor.extract(pages[fetch_result.seed_page_count:]))
         official_homepage_url = self._resolve_candidate_official_homepage(candidate)
         official_homepage_host = self._host_key(official_homepage_url)
         official_domain = self._domain_key(official_homepage_url)
@@ -574,7 +988,10 @@ class SearchService:
     if len(primary) >= effective_target:
       return primary
 
-    expanded = self._expand_related_candidates(query, primary)
+    if not self._should_expand_related_candidates(query, primary, target_count=effective_target):
+      return primary
+
+    expanded = self._expand_related_candidates(query, primary, target_count=effective_target)
     seen = {self._candidate_key(candidate) for candidate in primary}
     merged = list(primary)
     for candidate in expanded:
@@ -592,10 +1009,25 @@ class SearchService:
     self,
     query: str,
     primary: list[GitHubRepositoryCandidate],
+    *,
+    target_count: int | None = None,
   ) -> list[GitHubRepositoryCandidate]:
     related: list[GitHubRepositoryCandidate] = []
     seen = {self._candidate_key(candidate) for candidate in primary}
     query_tokens = set(self._tokenize(query))
+    effective_target = max(1, target_count or MAX_RELATED_EXPANSION_CANDIDATES)
+
+    def reached_target() -> bool:
+      if len(related) >= MAX_RELATED_EXPANSION_CANDIDATES:
+        return True
+      combined = [*primary, *related]
+      if len(combined) >= effective_target:
+        return True
+      return self._has_sufficient_high_confidence_candidates(
+        query,
+        combined,
+        min(effective_target, RELATED_EXPANSION_CONFIDENCE_TARGET),
+      )
 
     def append_candidate(candidate: GitHubRepositoryCandidate):
       if self._should_filter(candidate):
@@ -622,8 +1054,11 @@ class SearchService:
         owner_candidates = []
       for candidate in owner_candidates:
         append_candidate(candidate)
-        if len(related) >= MAX_RELATED_EXPANSION_CANDIDATES:
+        if reached_target():
           return related
+
+    if reached_target():
+      return related
 
     topics: list[str] = []
     for candidate in primary:
@@ -648,21 +1083,55 @@ class SearchService:
           if candidate.stars < 500:
             continue
         append_candidate(candidate)
-        if len(related) >= MAX_RELATED_EXPANSION_CANDIDATES:
+        if reached_target():
           return related
 
-    if len(related) < MAX_RELATED_EXPANSION_CANDIDATES:
+    if not reached_target():
       try:
         fallback = self._github_search_onevariant('topic:artificial-intelligence stars:>5000', per_page=6)
       except Exception:
         fallback = []
       for candidate in fallback:
         append_candidate(candidate)
-        if len(related) >= MAX_RELATED_EXPANSION_CANDIDATES:
+        if reached_target():
           break
 
     related.sort(key=lambda item: item.stars, reverse=True)
     return related
+
+  def _should_expand_related_candidates(
+    self,
+    query: str,
+    primary: list[GitHubRepositoryCandidate],
+    *,
+    target_count: int,
+  ) -> bool:
+    if not primary:
+      return False
+    if len(primary) < min(target_count, CRAWL_CONFIDENT_PRIMARY_COUNT):
+      return True
+    return not self._has_sufficient_high_confidence_candidates(
+      query,
+      primary,
+      min(target_count, CRAWL_CONFIDENT_PRIMARY_COUNT),
+    )
+
+  def _should_include_web_fallback(
+    self,
+    query: str,
+    crawl_candidates: list[GitHubRepositoryCandidate],
+    *,
+    target_count: int,
+  ) -> bool:
+    if not crawl_candidates:
+      return True
+    if len(crawl_candidates) < min(target_count, WEB_FALLBACK_CONFIDENT_CANDIDATE_COUNT):
+      return True
+    return not self._has_sufficient_high_confidence_candidates(
+      query,
+      crawl_candidates,
+      min(target_count, WEB_FALLBACK_CONFIDENT_CANDIDATE_COUNT),
+    )
 
   def _build_web_fallback_candidates(self, query: str) -> list[GitHubRepositoryCandidate]:
     root_to_candidate: dict[str, tuple[int, GitHubRepositoryCandidate]] = {}
@@ -763,17 +1232,20 @@ class SearchService:
 
   def _github_search(self, query: str, limit: int, filters: SearchFilters | None = None) -> list[GitHubRepositoryCandidate]:
     contains_cjk = self._contains_cjk(query)
-    variants = [
+    is_generic_query = self._is_generic_query(query)
+    primary_variants = [
       (f'{query} in:name', min(40, max(24, limit * 2))),
       (f'{query} in:description', min(28, max(16, limit + 4))),
+    ]
+    secondary_variants = [
       (f'{query} in:readme', min(28, max(16, limit + 4))),
     ]
     if contains_cjk:
-      variants = [
+      primary_variants = [
         (query, min(40, max(26, limit * 2))),
         (f'{query} AI', min(26, max(18, limit))),
-      ] + variants
-    if self._is_generic_query(query):
+      ] + primary_variants
+    if is_generic_query:
       community_per_page = min(26, max(14, limit))
       for suffix in COMMUNITY_INTENT_VARIANTS:
         if contains_cjk and not self._contains_cjk(suffix):
@@ -781,8 +1253,60 @@ class SearchService:
         if not contains_cjk and self._contains_cjk(suffix):
           continue
         variant_query = f'{query} {suffix}' if contains_cjk else f'{query} {suffix} in:readme'
-        variants.append((variant_query, community_per_page))
+        secondary_variants.append((variant_query, community_per_page))
 
+    unique_primary_variants = self._dedupe_github_variants(primary_variants)
+    unique_secondary_variants = self._dedupe_github_variants(secondary_variants)
+
+    all_candidates: list[GitHubRepositoryCandidate] = []
+    seen_keys: set[str] = set()
+    executed_variants = self._collect_github_variants(
+      query=query,
+      variants=unique_primary_variants,
+      limit=limit,
+      filters=filters,
+      all_candidates=all_candidates,
+      seen_keys=seen_keys,
+    )
+    skipped_secondary = False
+
+    if len(all_candidates) < limit:
+      should_skip_secondary = self._should_skip_github_secondary_variants(
+        query=query,
+        limit=limit,
+        candidates=all_candidates,
+        is_generic_query=is_generic_query,
+      )
+      if should_skip_secondary:
+        skipped_secondary = True
+      else:
+        executed_variants += self._collect_github_variants(
+          query=query,
+          variants=unique_secondary_variants,
+          limit=limit,
+          filters=filters,
+          all_candidates=all_candidates,
+          seen_keys=seen_keys,
+        )
+
+    all_candidates.sort(
+      key=lambda item: (
+        self._score_candidate_relevance(query, item),
+        item.stars,
+      ),
+      reverse=True,
+    )
+    self._debug_log(
+      'github_search query=%r variants=%d unique_candidates=%d limit=%d skipped_secondary=%s',
+      query,
+      executed_variants,
+      len(all_candidates),
+      limit,
+      skipped_secondary,
+    )
+    return all_candidates[:limit]
+
+  def _dedupe_github_variants(self, variants: list[tuple[str, int]]) -> list[tuple[str, int]]:
     unique_variants: list[tuple[str, int]] = []
     seen_variant_queries: set[str] = set()
     for variant_query, per_page in variants:
@@ -791,15 +1315,24 @@ class SearchService:
         continue
       seen_variant_queries.add(normalized_variant)
       unique_variants.append((normalized_variant, min(MAX_GITHUB_SEARCH_PER_PAGE, max(10, per_page))))
+    return unique_variants
 
-    all_candidates: list[GitHubRepositoryCandidate] = []
-    seen_keys: set[str] = set()
-
-    for chunk_start in range(0, len(unique_variants), GITHUB_VARIANT_MAX_WORKERS):
+  def _collect_github_variants(
+    self,
+    *,
+    query: str,
+    variants: list[tuple[str, int]],
+    limit: int,
+    filters: SearchFilters | None,
+    all_candidates: list[GitHubRepositoryCandidate],
+    seen_keys: set[str],
+  ) -> int:
+    executed_variants = 0
+    for chunk_start in range(0, len(variants), GITHUB_VARIANT_MAX_WORKERS):
       if len(all_candidates) >= limit:
         break
 
-      chunk = unique_variants[chunk_start:chunk_start + GITHUB_VARIANT_MAX_WORKERS]
+      chunk = variants[chunk_start:chunk_start + GITHUB_VARIANT_MAX_WORKERS]
       with ThreadPoolExecutor(max_workers=min(GITHUB_VARIANT_MAX_WORKERS, len(chunk))) as executor:
         chunk_futures = [
           (variant_query, per_page, executor.submit(self._github_search_onevariant, variant_query, per_page))
@@ -810,6 +1343,7 @@ class SearchService:
           if len(all_candidates) >= limit:
             break
 
+          executed_variants += 1
           try:
             raw_candidates = future.result()
           except Exception as exc:
@@ -840,21 +1374,53 @@ class SearchService:
             duplicate_count,
           )
 
-    all_candidates.sort(
-      key=lambda item: (
-        self._score_candidate_relevance(query, item),
-        item.stars,
-      ),
+      all_candidates.sort(
+        key=lambda item: (
+          self._score_candidate_relevance(query, item),
+          item.stars,
+        ),
+        reverse=True,
+      )
+    return executed_variants
+
+  def _should_skip_github_secondary_variants(
+    self,
+    *,
+    query: str,
+    limit: int,
+    candidates: list[GitHubRepositoryCandidate],
+    is_generic_query: bool,
+  ) -> bool:
+    if len(candidates) >= limit:
+      return True
+    if is_generic_query:
+      return False
+    return self._has_sufficient_high_confidence_candidates(
+      query,
+      candidates,
+      min(limit, GITHUB_PRIMARY_EARLY_STOP_MAX_CANDIDATES),
+    )
+
+  def _has_sufficient_high_confidence_candidates(
+    self,
+    query: str,
+    candidates: list[GitHubRepositoryCandidate],
+    target_count: int,
+  ) -> bool:
+    if not candidates:
+      return False
+
+    normalized_target = max(1, min(target_count, len(candidates), GITHUB_PRIMARY_EARLY_STOP_MAX_CANDIDATES))
+    scores = sorted(
+      (self._score_candidate_relevance(query, candidate) for candidate in candidates),
       reverse=True,
     )
-    self._debug_log(
-      'github_search query=%r variants=%d unique_candidates=%d limit=%d',
-      query,
-      len(unique_variants),
-      len(all_candidates),
-      limit,
+    high_confidence_count = sum(1 for score in scores if score >= GITHUB_PRIMARY_CONFIDENCE_SCORE)
+    strong_confidence_count = sum(1 for score in scores if score >= GITHUB_STRONG_CONFIDENCE_SCORE)
+    return (
+      high_confidence_count >= normalized_target
+      or (scores[0] >= GITHUB_STRONG_CONFIDENCE_SCORE and strong_confidence_count >= min(2, normalized_target))
     )
-    return all_candidates[:limit]
 
   def _score_candidate_relevance(self, query: str, candidate: GitHubRepositoryCandidate) -> int:
     normalized_query = query.strip().lower()
@@ -1529,7 +2095,7 @@ class SearchService:
 
     return None
 
-  def _load_viewed_group_filters(self) -> tuple[set[str], set[str]]:
+  def _load_viewed_group_filters(self) -> ViewedGroupFilters:
     viewed_ids: set[str] = set()
     viewed_match_keys: set[str] = set()
     normalized_image_updates: list[tuple[str, str]] = []
@@ -1551,7 +2117,7 @@ class SearchService:
         ).fetchall()
     except Exception as exc:
       logger.warning('Failed to read viewed groups: %s', exc)
-      return set(), set()
+      return ViewedGroupFilters()
 
     for row in rows:
       view_key = str(row['view_key'])
@@ -1588,11 +2154,19 @@ class SearchService:
 
     self._update_viewed_group_image_paths(normalized_image_updates)
     self._update_viewed_group_platforms(canonical_platform_updates)
-    return viewed_ids, viewed_match_keys
+    return ViewedGroupFilters(
+      viewed_ids=frozenset(viewed_ids),
+      viewed_match_keys=frozenset(viewed_match_keys),
+    )
 
-  def _filter_viewed_cards(self, cards: list[ProductCard]) -> list[ProductCard]:
-    viewed_keys, viewed_match_keys = self._load_viewed_group_filters()
-    if not viewed_keys and not viewed_match_keys:
+  def _filter_viewed_cards(
+    self,
+    cards: list[ProductCard],
+    *,
+    viewed_filters: ViewedGroupFilters | None = None,
+  ) -> list[ProductCard]:
+    resolved_filters = viewed_filters if viewed_filters is not None else self._load_viewed_group_filters()
+    if not resolved_filters.viewed_ids and not resolved_filters.viewed_match_keys:
       return cards
 
     filtered: list[ProductCard] = []
@@ -1601,7 +2175,7 @@ class SearchService:
         group
         for group in card.groups
         if (
-          group.group_id not in viewed_keys
+          group.group_id not in resolved_filters.viewed_ids
           and self._build_viewed_group_match_key(
             product_id=card.product_id,
             platform=group.platform,
@@ -1614,7 +2188,7 @@ class SearchService:
               else None
             ),
             image_path=group.entry.image_path if group.entry.type == 'qrcode' else None,
-          ) not in viewed_match_keys
+          ) not in resolved_filters.viewed_match_keys
         )
       ]
       if not remaining_groups:
@@ -1630,7 +2204,14 @@ class SearchService:
       )
     return filtered
 
-  def mark_group_viewed(self, product_id: str, app_name: str, group: OfficialGroup) -> None:
+  def mark_group_viewed(
+    self,
+    product_id: str,
+    app_name: str,
+    group: OfficialGroup,
+    *,
+    is_ignored: bool = False,
+  ) -> None:
     if not group.group_id:
       return
 
@@ -1668,8 +2249,9 @@ class SearchService:
             entry_url,
             image_path,
             fallback_url,
-            viewed_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            viewed_at,
+            is_ignored
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(view_key) DO UPDATE SET
             product_id = excluded.product_id,
             app_name = excluded.app_name,
@@ -1679,7 +2261,8 @@ class SearchService:
             entry_url = excluded.entry_url,
             image_path = excluded.image_path,
             fallback_url = excluded.fallback_url,
-            viewed_at = excluded.viewed_at
+            viewed_at = excluded.viewed_at,
+            is_ignored = excluded.is_ignored
           ''',
           (
             group.group_id,
@@ -1692,6 +2275,7 @@ class SearchService:
             image_path,
             fallback_url,
             now,
+            int(is_ignored),
           ),
         )
         connection.commit()
@@ -1811,8 +2395,9 @@ class SearchService:
             entry_url,
             image_path,
             fallback_url,
-            viewed_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            viewed_at,
+            is_ignored
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(view_key) DO UPDATE SET
             product_id = excluded.product_id,
             app_name = excluded.app_name,
@@ -1822,7 +2407,8 @@ class SearchService:
             entry_url = excluded.entry_url,
             image_path = excluded.image_path,
             fallback_url = excluded.fallback_url,
-            viewed_at = excluded.viewed_at
+            viewed_at = excluded.viewed_at,
+            is_ignored = 0
           ''',
           (
             view_key,
@@ -1835,6 +2421,7 @@ class SearchService:
             image_path,
             normalized_fallback,
             now,
+            0,
           ),
         )
         connection.commit()
@@ -1877,7 +2464,8 @@ class SearchService:
             image_path,
             fallback_url,
             viewed_at,
-            is_joined
+            is_joined,
+            is_ignored
           FROM viewed_groups
           ORDER BY viewed_at DESC
           ''',
@@ -1944,6 +2532,7 @@ class SearchService:
           entry=entry,
           viewed_at=viewed_at,
           is_joined=bool(row['is_joined']),
+          is_ignored=bool(row['is_ignored']),
         ),
       )
 
@@ -1972,6 +2561,25 @@ class SearchService:
       logger.warning('Failed to toggle group joined: %s', exc)
       return False
 
+  def toggle_group_ignored(self, view_key: str) -> bool:
+    if not view_key:
+      return False
+    try:
+      with get_connection(self.settings.database_path) as connection:
+        connection.execute(
+          'UPDATE viewed_groups SET is_ignored = 1 - is_ignored WHERE view_key = ?',
+          (view_key,),
+        )
+        connection.commit()
+        row = connection.execute(
+          'SELECT is_ignored FROM viewed_groups WHERE view_key = ?',
+          (view_key,),
+        ).fetchone()
+        return bool(row['is_ignored']) if row else False
+    except Exception as exc:
+      logger.warning('Failed to toggle group ignored: %s', exc)
+      return False
+
   def bulk_mark_viewed(self, items: list) -> int:
     """Mark multiple groups as viewed. Calls mark_group_viewed for each item."""
     count = 0
@@ -1981,6 +2589,7 @@ class SearchService:
           product_id=item.product_id,
           app_name=item.app_name,
           group=item.group,
+          is_ignored=getattr(item, 'is_ignored', False),
         )
         count += 1
       except Exception as exc:
@@ -1996,65 +2605,124 @@ class SearchService:
     candidate: GitHubRepositoryCandidate,
     *,
     page_cache: dict[str, FetchedPage | None] | None = None,
-    page_cache_lock: object | None = None,
-  ) -> list[FetchedPage]:
-    queue: list[tuple[str, bool]] = []
-    seen_urls: set[str] = set()
+    page_cache_lock: LockType | None = None,
+  ) -> CandidateFetchResult:
     pages: list[FetchedPage] = []
-    related_pages_added = 0
+    seed_urls: list[str] = []
+    seen_urls: set[str] = set()
 
-    def enqueue(url: str | None, *, related: bool):
+    def remember_url(url: str | None) -> str | None:
       if not url:
-        return
+        return None
       normalized = url.rstrip('/')
-      if normalized in seen_urls:
-        return
+      if not normalized or normalized in seen_urls:
+        return None
       seen_urls.add(normalized)
-      queue.append((normalized, related))
+      return normalized
 
-    enqueue(candidate.repo_url, related=False)
-    enqueue(candidate.homepage, related=False)
-
-    while queue and len(pages) < MAX_PAGES_PER_CANDIDATE:
-      current, related = queue.pop(0)
+    def fetch_cached_page(url: str) -> FetchedPage | None:
       cache_hit = False
       page = None
       if page_cache is not None:
         if page_cache_lock is not None:
           with page_cache_lock:
-            cache_hit = current in page_cache
-            page = page_cache.get(current)
+            cache_hit = url in page_cache
+            page = page_cache.get(url)
         else:
-          cache_hit = current in page_cache
-          page = page_cache.get(current)
+          cache_hit = url in page_cache
+          page = page_cache.get(url)
       if not cache_hit:
-        page = self._fetch_page(current)
+        page = self._fetch_page(url)
         if page_cache is not None:
           if page_cache_lock is not None:
             with page_cache_lock:
-              page_cache[current] = page
+              page_cache[url] = page
               if page is not None:
                 page_cache[page.final_url.rstrip('/')] = page
           else:
-            page_cache[current] = page
+            page_cache[url] = page
             if page is not None:
               page_cache[page.final_url.rstrip('/')] = page
-      if page is None:
-        continue
+      return page
 
-      pages.append(page)
-      if related or related_pages_added >= MAX_RELATED_LINKS:
-        continue
+    for seed in (candidate.repo_url, candidate.homepage):
+      normalized_seed = remember_url(seed)
+      if normalized_seed is not None:
+        seed_urls.append(normalized_seed)
 
+    for seed_url in seed_urls:
+      if len(pages) >= MAX_PAGES_PER_CANDIDATE:
+        break
+      page = fetch_cached_page(seed_url)
+      if page is not None:
+        pages.append(page)
+
+    if not pages:
+      return CandidateFetchResult()
+
+    seed_page_count = len(pages)
+
+    if not any(self._page_has_discovery_signal(page) for page in pages):
+      return CandidateFetchResult(
+        pages=pages,
+        seed_page_count=seed_page_count,
+      )
+
+    seed_groups = self._dedupe_groups(self.extractor.extract(pages))
+    if seed_groups:
+      return CandidateFetchResult(
+        pages=pages,
+        seed_extracted_groups=seed_groups,
+        seed_has_groups=True,
+        seed_page_count=seed_page_count,
+      )
+
+    queue: list[str] = []
+    related_pages_added = 0
+    for page in pages:
+      if not self._page_supports_related_expansion(page):
+        continue
       for related_url in self._collect_relevant_links(page, candidate):
         if related_pages_added >= MAX_RELATED_LINKS:
           break
         if len(pages) + len(queue) >= MAX_PAGES_PER_CANDIDATE:
           break
-        enqueue(related_url, related=True)
+        normalized_related = remember_url(related_url)
+        if normalized_related is None:
+          continue
+        queue.append(normalized_related)
         related_pages_added += 1
 
-    return pages
+    while queue and len(pages) < MAX_PAGES_PER_CANDIDATE:
+      current = queue.pop(0)
+      page = fetch_cached_page(current)
+      if page is None:
+        continue
+      pages.append(page)
+
+    return CandidateFetchResult(
+      pages=pages,
+      seed_extracted_groups=seed_groups,
+      seed_has_groups=bool(seed_groups),
+      seed_page_count=seed_page_count,
+    )
+
+  def _page_has_discovery_signal(self, page: FetchedPage) -> bool:
+    haystacks = [page.title, page.text, page.final_url, page.requested_url]
+    soup = page.soup or BeautifulSoup(page.html, 'html.parser')
+    for anchor in soup.find_all('a', href=True)[:20]:
+      haystacks.append(anchor.get('href', ''))
+      haystacks.append(anchor.get_text(' ', strip=True))
+    for image in soup.find_all('img')[:12]:
+      haystacks.append(image.get('alt', ''))
+      haystacks.append(image.get('title', ''))
+      haystacks.append(image.get('src', ''))
+
+    combined = ' '.join(part for part in haystacks if part).lower()
+    return any(keyword in combined for keyword in DISCOVERY_SIGNAL_KEYWORDS)
+
+  def _page_supports_related_expansion(self, page: FetchedPage) -> bool:
+    return self._page_has_discovery_signal(page)
 
   def _fetch_page(self, url: str) -> FetchedPage | None:
     try:
@@ -2080,33 +2748,48 @@ class SearchService:
     )
 
   def _fetch_page_with_browser(self, url: str) -> FetchedPage | None:
+    executor = self._ensure_browser_executor()
+    try:
+      future = executor.submit(self._fetch_page_with_browser_worker, url)
+      return future.result()
+    except RuntimeError as exc:
+      logger.warning('Browser worker is unavailable for %r: %s', url, exc)
+      return None
+    except Exception as exc:
+      logger.warning('Browser fetch failed for %r: %s', url, exc)
+      return None
+
+  def _fetch_page_with_browser_worker(self, url: str) -> FetchedPage | None:
     try:
       from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-      from playwright.sync_api import sync_playwright
     except Exception as exc:
       logger.warning('Playwright is unavailable for %r: %s', url, exc)
       return None
 
+    context = self._ensure_browser_context_worker()
+    if context is None:
+      return None
+
+    page = context.new_page()
     try:
-      with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
-        page = browser.new_page()
-        try:
-          page.goto(url, wait_until='domcontentloaded', timeout=BROWSER_FETCH_TIMEOUT_MS)
-          try:
-            page.wait_for_load_state('networkidle', timeout=BROWSER_FETCH_TIMEOUT_MS)
-          except PlaywrightTimeoutError:
-            pass
-          page.wait_for_timeout(BROWSER_WAIT_AFTER_LOAD_MS)
-          extra_visual_sources = self._collect_browser_extra_visual_sources(page)
-          html = page.content()
-          final_url = page.url
-          title = page.title()
-        finally:
-          browser.close()
+      page.goto(url, wait_until='domcontentloaded', timeout=BROWSER_FETCH_TIMEOUT_MS)
+      try:
+        page.wait_for_load_state('networkidle', timeout=BROWSER_FETCH_TIMEOUT_MS)
+      except PlaywrightTimeoutError:
+        pass
+      page.wait_for_timeout(BROWSER_WAIT_AFTER_LOAD_MS)
+      extra_visual_sources = self._collect_browser_extra_visual_sources(page)
+      html = page.content()
+      final_url = page.url
+      title = page.title()
     except Exception as exc:
       logger.warning('Browser fetch failed for %r: %s', url, exc)
       return None
+    finally:
+      try:
+        page.close()
+      except Exception:
+        pass
 
     soup = BeautifulSoup(html, 'html.parser')
     return FetchedPage(
@@ -2119,6 +2802,48 @@ class SearchService:
       soup=soup,
       extra_visual_sources=extra_visual_sources,
     )
+
+  def _ensure_browser_context_worker(self):
+    if self._browser_context is not None:
+      return self._browser_context
+
+    try:
+      from playwright.sync_api import sync_playwright
+    except Exception as exc:
+      logger.warning('Playwright is unavailable: %s', exc)
+      return None
+
+    try:
+      self._playwright = sync_playwright().start()
+      self._browser = self._playwright.chromium.launch(headless=True)
+      self._browser_context = self._browser.new_context(user_agent=self.settings.user_agent)
+      return self._browser_context
+    except Exception as exc:
+      logger.warning('Failed to initialize Playwright browser/context: %s', exc)
+      self._close_browser_worker()
+      return None
+
+  def _close_browser_worker(self) -> None:
+    if self._browser_context is not None:
+      try:
+        self._browser_context.close()
+      except Exception:
+        pass
+      self._browser_context = None
+
+    if self._browser is not None:
+      try:
+        self._browser.close()
+      except Exception:
+        pass
+      self._browser = None
+
+    if self._playwright is not None:
+      try:
+        self._playwright.stop()
+      except Exception:
+        pass
+      self._playwright = None
 
   def _collect_browser_extra_visual_sources(self, page) -> tuple[ExtraVisualSource, ...]:
     try:
@@ -2311,6 +3036,8 @@ class SearchService:
       joined_text = f"{anchor.get_text(' ', strip=True)} {anchor_image_signals} {absolute}".lower()
       if not any(keyword in joined_text for keyword in RELATED_PAGE_KEYWORDS):
         continue
+      if self._is_low_value_related_link(absolute) and not self._has_strong_related_signal(joined_text):
+        continue
 
       normalized = absolute.rstrip('/')
       if normalized in seen:
@@ -2376,6 +3103,32 @@ class SearchService:
     if '/docs' in url or 'docs.' in url or 'documentation' in joined_text:
       score -= 40
     return score
+
+  def _has_strong_related_signal(self, joined_text: str) -> bool:
+    return any(
+      keyword in joined_text
+      for keyword in (
+        'discord',
+        'qq',
+        'wechat',
+        'weixin',
+        'feishu',
+        'join',
+        'invite',
+        '官方群',
+        '交流群',
+        '加群',
+        '入群',
+      )
+    )
+
+  def _is_low_value_related_link(self, url: str) -> bool:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    if host.startswith('docs.'):
+      return True
+    return any(hint in path for hint in LOW_VALUE_RELATED_PATH_HINTS)
 
   def _is_noisy_related_link(self, url: str) -> bool:
     parsed = urlparse(url)

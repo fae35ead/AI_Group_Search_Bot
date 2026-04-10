@@ -92,16 +92,27 @@ class SearchRequest(BaseModel):
   limit: int = Field(default=10, ge=3, le=50)
 
 
+class SearchJobStatus(StrEnum):
+  PENDING = 'pending'
+  RUNNING = 'running'
+  COMPLETED = 'completed'
+  FAILED = 'failed'
+
+
 class SearchResponse(BaseModel):
   query: str
   results: list[ProductCard]
   empty_message: str | None = None
+  job_id: str | None = None
+  job_status: SearchJobStatus | None = None
+  is_partial: bool = False
 
 
 class MarkViewedGroupRequest(BaseModel):
   product_id: str
   app_name: str
   group: OfficialGroup
+  is_ignored: bool = False
 
 
 class MarkViewedGroupResponse(BaseModel):
@@ -126,6 +137,7 @@ class ViewedGroupItem(BaseModel):
   entry: GroupEntry
   viewed_at: datetime
   is_joined: bool = False
+  is_ignored: bool = False
 
 
 class ViewedGroupsResponse(BaseModel):
@@ -135,6 +147,11 @@ class ViewedGroupsResponse(BaseModel):
 class ToggleJoinedResponse(BaseModel):
   ok: Literal[True]
   is_joined: bool
+
+
+class ToggleIgnoredResponse(BaseModel):
+  ok: Literal[True]
+  is_ignored: bool
 
 
 class BulkMarkViewedRequest(BaseModel):

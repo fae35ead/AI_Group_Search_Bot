@@ -240,6 +240,27 @@ NOISE_LINK_HOSTS = {
   'ebay.com',
   'www.ebay.com',
 }
+PAGE_SIGNAL_MAX_ANCHORS = 24
+PAGE_SIGNAL_MAX_IMAGES = 16
+VISUAL_SIGNAL_HINTS = (
+  'qrcode',
+  'qr-code',
+  'qr code',
+  'qr',
+  '二维码',
+  '扫码',
+  'scan',
+  'wechat',
+  'weixin',
+  'qq',
+  'discord',
+  'feishu',
+  'lark',
+  'group',
+  'community',
+  'join',
+  'invite',
+)
 
 
 @dataclass(frozen=True)
@@ -272,7 +293,10 @@ class EntryExtractor:
         break
 
       soup = page.soup or BeautifulSoup(page.html, 'html.parser')
+      if not self._page_has_discovery_signal(page, soup):
+        continue
       blocks = self._select_scan_blocks(soup, page.final_url)
+      allow_visual_scan = self._page_supports_visual_scan(page, soup)
       visual_attempts = 0
       ordered_candidates: list[tuple[int, ExtractedGroupCandidate]] = []
       visual_tasks: list[VisualCandidateTask] = []
@@ -282,31 +306,34 @@ class EntryExtractor:
         if candidate_count >= MAX_CANDIDATES_PER_PAGE:
           break
 
-        images = sorted(
-          block.find_all('img'),
-          key=lambda image: self._score_image_priority(image, page.final_url),
-          reverse=True,
-        )
-        for image in images:
-          if visual_attempts >= MAX_VISUAL_ATTEMPTS_PER_PAGE:
-            break
-          nearby = self._collect_nearby_text(image)
-          task = self._build_visual_task_from_img_tag(
-            image,
-            page.final_url,
-            context=nearby,
-            order=next_order,
+        if allow_visual_scan:
+          images = sorted(
+            block.find_all('img'),
+            key=lambda image: self._score_image_priority(image, page.final_url),
+            reverse=True,
           )
-          if task is None:
-            continue
-          visual_tasks.append(task)
-          visual_attempts += 1
-          next_order += 1
+          for image in images:
+            if visual_attempts >= MAX_VISUAL_ATTEMPTS_PER_PAGE:
+              break
+            nearby = self._collect_nearby_text(image)
+            task = self._build_visual_task_from_img_tag(
+              image,
+              page.final_url,
+              context=nearby,
+              order=next_order,
+            )
+            if task is None:
+              continue
+            visual_tasks.append(task)
+            visual_attempts += 1
+            next_order += 1
 
         for link in block.find_all('a', href=True):
           nearby = self._collect_nearby_text(link)
           absolute_link = urljoin(page.final_url, link.get('href', ''))
           is_image_link = self._looks_like_image_url(absolute_link)
+          if is_image_link and not allow_visual_scan:
+            continue
           if is_image_link and visual_attempts >= MAX_VISUAL_ATTEMPTS_PER_PAGE:
             continue
           if is_image_link:
@@ -332,19 +359,20 @@ class EntryExtractor:
           ordered_candidates.append((next_order, candidate))
           next_order += 1
 
-      for source in page.extra_visual_sources:
-        if visual_attempts >= MAX_VISUAL_ATTEMPTS_PER_PAGE:
-          break
-        task = self._build_visual_task_from_extra_source(
-          source,
-          page.final_url,
-          order=next_order,
-        )
-        if task is None:
-          continue
-        visual_tasks.append(task)
-        visual_attempts += 1
-        next_order += 1
+      if allow_visual_scan:
+        for source in page.extra_visual_sources:
+          if visual_attempts >= MAX_VISUAL_ATTEMPTS_PER_PAGE:
+            break
+          task = self._build_visual_task_from_extra_source(
+            source,
+            page.final_url,
+            order=next_order,
+          )
+          if task is None:
+            continue
+          visual_tasks.append(task)
+          visual_attempts += 1
+          next_order += 1
 
       ordered_candidates.extend(self._extract_visual_candidates(visual_tasks))
       ordered_candidates.sort(key=lambda item: item[0])
@@ -355,6 +383,32 @@ class EntryExtractor:
         candidate_count += 1
 
     return candidates
+
+  def _page_has_discovery_signal(self, page: FetchedPage, soup: BeautifulSoup) -> bool:
+    combined = self._collect_page_signal_text(page, soup)
+    return (
+      self._has_group_intent(combined)
+      or self._has_strong_group_intent(combined)
+      or self._has_qq_group_context(combined)
+      or any(hint in combined for hint in VISUAL_SIGNAL_HINTS)
+    )
+
+  def _page_supports_visual_scan(self, page: FetchedPage, soup: BeautifulSoup) -> bool:
+    combined = self._collect_page_signal_text(page, soup)
+    if any(hint in combined for hint in VISUAL_SIGNAL_HINTS):
+      return True
+    return any(source.context and any(hint in source.context.lower() for hint in VISUAL_SIGNAL_HINTS) for source in page.extra_visual_sources)
+
+  def _collect_page_signal_text(self, page: FetchedPage, soup: BeautifulSoup) -> str:
+    parts = [page.title, page.text, page.final_url, page.requested_url]
+    for anchor in soup.find_all('a', href=True)[:PAGE_SIGNAL_MAX_ANCHORS]:
+      parts.append(anchor.get('href', ''))
+      parts.append(anchor.get_text(' ', strip=True))
+      parts.append(self._collect_anchor_image_signals(anchor))
+    for image in soup.find_all('img')[:PAGE_SIGNAL_MAX_IMAGES]:
+      for attr in ('alt', 'title', 'aria-label', 'src', 'data-src', 'data-original'):
+        parts.append(image.get(attr, ''))
+    return ' '.join(part for part in parts if part).lower()
 
   # -------------------------------------------------------------------------
   # README / context helpers
