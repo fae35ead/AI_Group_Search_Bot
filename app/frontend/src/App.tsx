@@ -99,7 +99,39 @@ type ManualUploadFormState = {
 }
 
 type SearchMode = 'initial' | 'verify'
+type SearchRequestSnapshot = {
+  query: string
+  minStars: string
+  createdAfter: string
+  createdBefore: string
+  resultLimit: number
+}
+
+type ActiveSearchSnapshot = SearchRequestSnapshot & {
+  mode: SearchMode
+}
+
 const SEARCH_JOB_POLL_MS = 1200
+
+function buildSearchRequestSnapshot(input: SearchRequestSnapshot): SearchRequestSnapshot {
+  return {
+    query: input.query.trim(),
+    minStars: input.minStars.trim(),
+    createdAfter: input.createdAfter.trim(),
+    createdBefore: input.createdBefore.trim(),
+    resultLimit: input.resultLimit,
+  }
+}
+
+function isSameSearchRequest(left: SearchRequestSnapshot, right: SearchRequestSnapshot): boolean {
+  return (
+    left.query === right.query &&
+    left.minStars === right.minStars &&
+    left.createdAfter === right.createdAfter &&
+    left.createdBefore === right.createdBefore &&
+    left.resultLimit === right.resultLimit
+  )
+}
 
 const PLATFORM_OPTIONS: Array<{ label: string; value: Platform }> = [
   { label: '微信', value: '\u5fae\u4fe1' },
@@ -173,11 +205,40 @@ function App() {
   const [manualUploadError, setManualUploadError] = useState<string | null>(null)
   const [manualForm, setManualForm] = useState<ManualUploadFormState>(INITIAL_MANUAL_FORM)
   const [submittedQuery, setSubmittedQuery] = useState('')
+  const [activeSearchSnapshot, setActiveSearchSnapshot] = useState<ActiveSearchSnapshot | null>(null)
   const activeSearchControllerRef = useRef<AbortController | null>(null)
 
   const loading = searchMode === 'initial'
   const verifying = searchMode === 'verify'
   const showInitialSkeleton = searchMode === 'initial'
+  const hasActiveSearch = searchMode !== null || searchJobRunning
+
+  const currentSearchSnapshot = useMemo(
+    () =>
+      buildSearchRequestSnapshot({
+        query,
+        minStars,
+        createdAfter,
+        createdBefore,
+        resultLimit,
+      }),
+    [query, minStars, createdAfter, createdBefore, resultLimit],
+  )
+
+  const canRestartSearch =
+    hasActiveSearch &&
+    activeSearchSnapshot !== null &&
+    !isSameSearchRequest(activeSearchSnapshot, currentSearchSnapshot)
+
+  const searchButtonLabel = canRestartSearch
+    ? '重新搜索'
+    : hasActiveSearch
+      ? activeSearchSnapshot?.mode === 'verify'
+        ? '验证中…'
+        : '搜索中…'
+      : '搜索'
+
+  const isSearchButtonDisabled = hasActiveSearch && !canRestartSearch
 
   const displayedResults = useMemo(() => {
     let filtered = rawResults
@@ -237,15 +298,33 @@ function App() {
     return Object.keys(filters).length > 0 ? filters : undefined
   }, [createdAfter, createdBefore, minStars])
 
-  const runSearch = useCallback(async (trimmedQuery: string, mode: SearchMode, requestedLimit = resultLimit) => {
+  const interruptActiveSearch = useCallback(() => {
     activeSearchControllerRef.current?.abort()
-    const controller = new AbortController()
-    activeSearchControllerRef.current = controller
+    activeSearchControllerRef.current = null
+    setSearchMode(null)
     setSearchJobId(null)
     setSearchJobRunning(false)
+    setActiveSearchSnapshot(null)
+  }, [])
+
+  const runSearch = useCallback(async (trimmedQuery: string, mode: SearchMode, requestedLimit = resultLimit) => {
+    interruptActiveSearch()
+    const controller = new AbortController()
+    activeSearchControllerRef.current = controller
+    const nextSnapshot: ActiveSearchSnapshot = {
+      ...buildSearchRequestSnapshot({
+        query: trimmedQuery,
+        minStars,
+        createdAfter,
+        createdBefore,
+        resultLimit: requestedLimit,
+      }),
+      mode,
+    }
 
     setSearchError(null)
     setSearchMode(mode)
+    setActiveSearchSnapshot(nextSnapshot)
     if (mode !== 'verify') {
       setSubmittedQuery(trimmedQuery)
     }
@@ -286,7 +365,7 @@ function App() {
         setSearchMode(null)
       }
     }
-  }, [buildFilters, resultLimit])
+  }, [buildFilters, createdAfter, createdBefore, interruptActiveSearch, minStars, resultLimit])
 
   useEffect(() => {
     async function loadHealth() {
@@ -351,6 +430,12 @@ function App() {
   }, [viewedGroups])
 
   useEffect(() => {
+    if (!hasActiveSearch) {
+      setActiveSearchSnapshot(null)
+    }
+  }, [hasActiveSearch])
+
+  useEffect(() => {
     if (!searchJobId || !searchJobRunning) {
       return
     }
@@ -412,6 +497,9 @@ function App() {
     const trimmed = (nextQuery ?? query).trim()
 
     if (!trimmed) {
+      if (hasActiveSearch) {
+        interruptActiveSearch()
+      }
       setSearchError('请输入 AI 工具名、关键词、官网域名或 GitHub 仓库。')
       setEmptyMessage(null)
       setRawResults([])
@@ -823,8 +911,8 @@ function App() {
                 onChange={(event) => setQuery(event.target.value)}
                 placeholder="例如 ChatGPT、FastGPT、n8n、cursor.com、github.com/labring/FastGPT"
               />
-              <button className="action-button primary" disabled={loading || verifying} type="submit">
-                {loading ? '搜索中…' : '搜索'}
+              <button className="action-button primary" disabled={isSearchButtonDisabled} type="submit">
+                {searchButtonLabel}
               </button>
               <button
                 disabled={rawResults.length === 0 || loading || verifying}

@@ -2,7 +2,7 @@ import base64
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from urllib.parse import urljoin, unquote, urlparse
+from urllib.parse import parse_qs, urljoin, unquote, urlparse
 
 import cv2
 import httpx
@@ -668,7 +668,12 @@ class EntryExtractor:
     absolute = urljoin(page_url, href)
     own_text = tag.get_text(' ', strip=True)
     anchor_image_signals = self._collect_anchor_image_signals(tag)
-    full_context = f'{own_text} {anchor_image_signals} {context} {absolute}'.strip()
+    full_context = self._build_visual_link_context(
+      absolute=absolute,
+      own_text=own_text,
+      anchor_image_signals=anchor_image_signals,
+      nearby_context=context,
+    )
     platform = self._detect_platform(absolute, own_text, anchor_image_signals, context)
     if platform is None:
       return None
@@ -723,7 +728,12 @@ class EntryExtractor:
     absolute = urljoin(page_url, href)
     own_text = tag.get_text(' ', strip=True)
     anchor_image_signals = self._collect_anchor_image_signals(tag)
-    full_context = f'{own_text} {anchor_image_signals} {context} {absolute}'.strip()
+    full_context = self._build_visual_link_context(
+      absolute=absolute,
+      own_text=own_text,
+      anchor_image_signals=anchor_image_signals,
+      nearby_context=context,
+    )
     platform = self._detect_platform(absolute, own_text, anchor_image_signals, context)
     if platform is None or not self._looks_like_image_url(absolute):
       return None
@@ -739,6 +749,23 @@ class EntryExtractor:
       full_context=full_context,
       entry_url=None,
     )
+
+  def _build_visual_link_context(
+    self,
+    *,
+    absolute: str,
+    own_text: str,
+    anchor_image_signals: str,
+    nearby_context: str,
+  ) -> str:
+    local_context = f'{own_text} {anchor_image_signals} {absolute}'.strip()
+    if (
+      self._detect_platform(absolute, own_text, anchor_image_signals) is not None
+      or self._has_group_intent(local_context)
+      or self._looks_like_qrcode_url(absolute)
+    ):
+      return local_context
+    return f'{local_context} {nearby_context}'.strip()
 
   def _build_visual_task_from_extra_source(
     self,
@@ -912,24 +939,33 @@ class EntryExtractor:
     if not qr_detected and self._is_visually_noisy(width, height, len(image_bytes)):
       return None
 
-    platform_from_decode = self._detect_platform(decoded_payload) if decoded_payload else None
-    if decoded_payload and platform_from_decode:
-      resolved_entry_url = (
-        self._resolve_group_link(entry_url, platform_from_decode)
-        if entry_url
-        else None
-      )
-      return self._build_visual_candidate(
-        platform=platform_from_decode,
+    if decoded_payload:
+      if self._should_reject_decoded_payload(
+        decoded_payload,
+        has_group_intent=has_group_intent,
+        has_strong_group_intent=has_strong_group_intent,
+        has_account_intent=has_account_intent,
+        has_negative_context=has_negative_context,
+      ):
+        return None
+
+      decoded_candidate = self._build_candidate_from_decoded_payload(
+        decoded_payload=decoded_payload,
         page_url=page_url,
         full_context=full_context,
         image_url=image_url,
         image_bytes=final_image_bytes,
         content_type=final_content_type,
-        entry_url=resolved_entry_url,
-        decoded_payload=decoded_payload,
-        verified=True,
+        entry_url=entry_url,
+        resolved_entry_from_text=resolved_entry_from_text,
+        platform_from_text=platform_from_text,
+        has_group_intent=has_group_intent,
+        has_strong_group_intent=has_strong_group_intent,
+        has_account_intent=has_account_intent,
+        has_negative_context=has_negative_context,
       )
+      if decoded_candidate is not None:
+        return decoded_candidate
 
     # If we only detected qr points but cannot decode or crop a qr area,
     # treat it as weak signal and drop to avoid screenshot false positives.
@@ -999,6 +1035,7 @@ class EntryExtractor:
     entry_url: str | None,
     decoded_payload: str | None,
     verified: bool,
+    fallback_url: str | None = None,
   ) -> ExtractedGroupCandidate:
     return ExtractedGroupCandidate(
       platform=platform,
@@ -1009,10 +1046,90 @@ class EntryExtractor:
       image_bytes=image_bytes,
       image_content_type=content_type,
       entry_url=entry_url,
-      fallback_url=entry_url or page_url,
+      fallback_url=fallback_url or entry_url or page_url,
       decoded_payload=decoded_payload,
       qrcode_verified=verified,
       source_urls=[page_url],
+    )
+
+  def _build_candidate_from_decoded_payload(
+    self,
+    *,
+    decoded_payload: str,
+    page_url: str,
+    full_context: str,
+    image_url: str,
+    image_bytes: bytes,
+    content_type: str | None,
+    entry_url: str | None,
+    resolved_entry_from_text: str | None,
+    platform_from_text: Platform | None,
+    has_group_intent: bool,
+    has_strong_group_intent: bool,
+    has_account_intent: bool,
+    has_negative_context: bool,
+  ) -> ExtractedGroupCandidate | None:
+    platform_from_decode = self._detect_platform(decoded_payload)
+    resolved_entry_from_payload = (
+      self._resolve_group_link(decoded_payload, platform_from_decode)
+      if platform_from_decode is not None
+      else None
+    )
+    if resolved_entry_from_payload is not None and platform_from_decode is not None:
+      return self._build_visual_candidate(
+        platform=platform_from_decode,
+        page_url=page_url,
+        full_context=full_context,
+        image_url=image_url,
+        image_bytes=image_bytes,
+        content_type=content_type,
+        entry_url=resolved_entry_from_payload,
+        fallback_url=decoded_payload,
+        decoded_payload=decoded_payload,
+        verified=True,
+      )
+
+    payload_host = self._host_key(decoded_payload)
+    if (
+      platform_from_decode is not None
+      and payload_host is not None
+      and self._is_short_link_host(payload_host)
+      and not has_account_intent
+      and not has_negative_context
+    ):
+      return self._build_visual_candidate(
+        platform=platform_from_decode,
+        page_url=page_url,
+        full_context=full_context,
+        image_url=image_url,
+        image_bytes=image_bytes,
+        content_type=content_type,
+        entry_url=resolved_entry_from_text,
+        fallback_url=decoded_payload,
+        decoded_payload=decoded_payload,
+        verified=True,
+      )
+
+    if (
+      platform_from_text is None
+      or not self._looks_like_web_url(decoded_payload)
+      or not has_group_intent
+    ):
+      return None
+    if has_account_intent or (has_negative_context and not has_strong_group_intent):
+      return None
+
+    return self._build_visual_candidate(
+      platform=platform_from_text,
+      page_url=page_url,
+      full_context=full_context,
+      image_url=image_url,
+      image_bytes=image_bytes,
+      content_type=content_type,
+      entry_url=resolved_entry_from_text,
+      fallback_url=decoded_payload,
+      decoded_payload=decoded_payload,
+      verified=True,
     )
 
   # -------------------------------------------------------------------------
@@ -1036,6 +1153,34 @@ class EntryExtractor:
     if has_account_intent and not has_group_intent and not has_qr_url_hint:
       return False
     return has_platform or has_group_intent or has_qr_url_hint
+
+  def _should_reject_decoded_payload(
+    self,
+    decoded_payload: str,
+    *,
+    has_group_intent: bool,
+    has_strong_group_intent: bool,
+    has_account_intent: bool,
+    has_negative_context: bool,
+  ) -> bool:
+    if self._payload_looks_like_non_group_entry(decoded_payload):
+      return True
+    del has_group_intent
+    del has_strong_group_intent
+    del has_account_intent
+    del has_negative_context
+    return False
+
+  def _payload_looks_like_non_group_entry(self, payload: str) -> bool:
+    if self._is_known_non_group_link(payload):
+      return True
+
+    parsed = urlparse(payload.strip())
+    host = parsed.netloc.lower().removeprefix('www.')
+    path = parsed.path.lower()
+    if host == 'weixin.qq.com' and path.startswith(('/r/', '/q/')):
+      return True
+    return False
 
   def _has_group_intent(self, text: str) -> bool:
     return self._group_intent_score(text) > 0
@@ -1096,6 +1241,10 @@ class EntryExtractor:
     lowered = url.lower()
     return any(token in lowered for token in QRCODE_URL_HINTS)
 
+  def _looks_like_web_url(self, value: str) -> bool:
+    parsed = urlparse(value.strip())
+    return parsed.scheme in {'http', 'https'} and bool(parsed.netloc)
+
   def _decode_image(self, image_bytes: bytes) -> np.ndarray | None:
     image_array = np.frombuffer(image_bytes, dtype=np.uint8)
     return cv2.imdecode(image_array, cv2.IMREAD_COLOR)
@@ -1105,7 +1254,7 @@ class EntryExtractor:
   # -------------------------------------------------------------------------
 
   def _download_image(self, image_url: str) -> tuple[bytes, str] | None:
-    resolved_url = self._resolve_camo_url(image_url)
+    resolved_url = self._normalize_image_download_url(image_url)
     if resolved_url.startswith('data:image/'):
       header, encoded = resolved_url.split(',', 1)
       mime = header.split(';', 1)[0].split(':', 1)[1]
@@ -1127,6 +1276,30 @@ class EntryExtractor:
 
     return response.content, response.headers.get('content-type', 'image/png')
 
+  def _normalize_image_download_url(self, image_url: str) -> str:
+    resolved_url = self._resolve_camo_url(image_url.strip())
+    if resolved_url.startswith('data:image/'):
+      return resolved_url
+
+    parsed = urlparse(resolved_url)
+    host = parsed.netloc.lower().removeprefix('www.')
+    if host != 'github.com':
+      return resolved_url
+
+    path_parts = [unquote(part) for part in parsed.path.split('/') if part]
+    if len(path_parts) < 5 or path_parts[2] not in {'blob', 'raw'}:
+      return resolved_url
+
+    raw_query = parse_qs(parsed.query).get('raw')
+    if path_parts[2] == 'blob' and raw_query and raw_query[-1].lower() not in {'1', 'true'}:
+      return resolved_url
+
+    owner, repo, _mode, ref = path_parts[:4]
+    file_path = '/'.join(path_parts[4:])
+    if not file_path:
+      return resolved_url
+    return f'https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{file_path}'
+
   def _resolve_camo_url(self, url: str) -> str:
     if not url.startswith('https://camo.githubusercontent.com/'):
       return url
@@ -1147,6 +1320,18 @@ class EntryExtractor:
     query = dict([part.split('=', 1) for part in parsed.query.split('&') if '=' in part])
     origin = query.get('url')
     return unquote(origin) if origin else url
+
+  def _host_key(self, url: str | None) -> str | None:
+    if not url:
+      return None
+
+    parsed = urlparse(url.strip())
+    host = parsed.netloc.lower().rstrip('.')
+    if not host:
+      return None
+    if host.startswith('www.'):
+      host = host[4:]
+    return host
 
   def _analyze_qrcode(self, image: np.ndarray) -> tuple[str | None, np.ndarray | None]:
     detector = cv2.QRCodeDetector()

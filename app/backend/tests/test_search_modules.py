@@ -2530,6 +2530,116 @@ class EntryExtractorTests(unittest.TestCase):
       'https://raw.githubusercontent.com/deepseek-ai/DeepSeek-V2/refs/heads/main/figures/qr.jpeg',
     )
 
+  def test_download_image_normalizes_github_blob_urls(self):
+    response = unittest.mock.Mock()
+    response.raise_for_status.return_value = None
+    response.content = self.square_image
+    response.headers = {'content-type': 'image/png'}
+    cases = [
+      (
+        'https://github.com/QwenLM/Qwen-Agent/blob/main/assets/wechat.png',
+        'https://raw.githubusercontent.com/QwenLM/Qwen-Agent/main/assets/wechat.png',
+      ),
+      (
+        'https://github.com/silent-lad/super-agent-party/blob/main/doc/image/Q%E7%BE%A4.jpg?raw=1',
+        'https://raw.githubusercontent.com/silent-lad/super-agent-party/main/doc/image/Q群.jpg',
+      ),
+    ]
+
+    with patch.object(self.extractor._client, 'get', return_value=response) as get_mock:
+      for original_url, expected_url in cases:
+        with self.subTest(url=original_url):
+          downloaded = self.extractor._download_image(original_url)
+          self.assertEqual(downloaded, (self.square_image, 'image/png'))
+          self.assertEqual(get_mock.call_args.args[0], expected_url)
+
+  def test_rejects_wechat_follow_payload_even_with_group_context(self):
+    qr_points = np.array([[[80.0, 80.0], [220.0, 80.0], [220.0, 220.0], [80.0, 220.0]]], dtype=np.float32)
+
+    with patch.object(self.extractor, '_analyze_qrcode', return_value=('http://weixin.qq.com/r/9Du6opTEdskJrdDB927m', qr_points)), patch.object(
+      self.extractor,
+      '_crop_qrcode',
+      return_value=self.square_image,
+    ):
+      candidate = self.extractor._extract_visual_candidate(
+        image_url='https://cdn.example.com/wechat-group.png',
+        page_url='https://example.com',
+        full_context='wechat discussion group qrcode join',
+        image_bytes=self.square_image,
+        content_type='image/png',
+        entry_url=None,
+      )
+
+    self.assertIsNone(candidate)
+
+  def test_accepts_decoded_custom_shortlink_qrcode_with_group_context(self):
+    qr_points = np.array([[[80.0, 80.0], [220.0, 80.0], [220.0, 220.0], [80.0, 220.0]]], dtype=np.float32)
+    cases = [
+      (Platform.QQ, 'qq official group qrcode join', 'https://qt.cool/c/OpenClaw'),
+      (Platform.WECHAT, 'wechat discussion group qrcode join', 'https://qt.cool/c/OpenClawWx'),
+      (Platform.FEISHU, 'feishu official discussion group qrcode join', 'https://qt.cool/c/feishu'),
+    ]
+
+    for platform, context, payload in cases:
+      with self.subTest(platform=platform.value):
+        with patch.object(self.extractor, '_analyze_qrcode', return_value=(payload, qr_points)), patch.object(
+          self.extractor,
+          '_crop_qrcode',
+          return_value=self.square_image,
+        ):
+          candidate = self.extractor._extract_visual_candidate(
+            image_url='https://cdn.example.com/community-qrcode.png',
+            page_url='https://example.com/community',
+            full_context=context,
+            image_bytes=self.square_image,
+            content_type='image/png',
+            entry_url=None,
+          )
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertEqual(candidate.platform, platform)
+        self.assertTrue(candidate.qrcode_verified)
+        self.assertEqual(candidate.entry_url, None)
+        self.assertEqual(candidate.fallback_url, payload)
+        self.assertEqual(candidate.decoded_payload, payload)
+
+  def test_accepts_reliable_decoded_group_link_despite_noisy_nearby_context(self):
+    qr_points = np.array([[[80.0, 80.0], [220.0, 80.0], [220.0, 220.0], [80.0, 220.0]]], dtype=np.float32)
+
+    with patch.object(
+      self.extractor,
+      '_download_image',
+      return_value=(self.square_image, 'image/png'),
+    ), patch.object(
+      self.extractor,
+      '_analyze_qrcode',
+      return_value=('https://work.weixin.qq.com/gm/7a4c13e2396e12538d3764bae80a4961', qr_points),
+    ):
+      page = FetchedPage(
+        requested_url='https://github.com/QwenLM/Qwen-Agent',
+        final_url='https://github.com/QwenLM/Qwen-Agent',
+        html='''
+          <html><body>
+            <article class="markdown-body">
+              <a href="https://github.com/QwenLM/Qwen/blob/main/assets/wechat.png">WeChat (微信)</a>
+              <p>Documentation Discord Repository files navigation</p>
+            </article>
+          </body></html>
+        ''',
+        title='Qwen-Agent',
+        text='Documentation Discord Repository files navigation',
+      )
+
+      candidates = self.extractor.extract([page])
+
+    self.assertEqual(len(candidates), 1)
+    self.assertEqual(candidates[0].platform, Platform.WECOM)
+    self.assertEqual(
+      candidates[0].entry_url,
+      'https://work.weixin.qq.com/gm/7a4c13e2396e12538d3764bae80a4961',
+    )
+
   def test_extract_reuses_cached_page_soup(self):
     html = '''
       <html><body>

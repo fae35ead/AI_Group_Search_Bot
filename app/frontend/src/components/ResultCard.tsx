@@ -21,6 +21,34 @@ function getGroupLabel(group: OfficialGroup) {
   return formatGroupLabel(group.platform, group.groupType)
 }
 
+function isEquivalentEntry(left: OfficialGroup['entry'], right: OfficialGroup['entry']) {
+  if (left.type !== right.type) {
+    return false
+  }
+
+  if (left.type === 'qrcode' && right.type === 'qrcode') {
+    return left.imagePath === right.imagePath && left.fallbackUrl === right.fallbackUrl
+  }
+
+  if (left.type === 'qq_number' && right.type === 'qq_number') {
+    return left.qqNumber === right.qqNumber
+  }
+
+  if (left.type === 'link' && right.type === 'link') {
+    return left.url === right.url
+  }
+
+  return false
+}
+
+function isEquivalentGroup(left: OfficialGroup, right: OfficialGroup) {
+  return (
+    left.platform === right.platform &&
+    left.groupType === right.groupType &&
+    isEquivalentEntry(left.entry, right.entry)
+  )
+}
+
 type ResultCardProps = {
   card: ProductCard
   index: number
@@ -53,8 +81,43 @@ export function ResultCard({
     return null
   }
 
-  const secondaryGroups = groups.filter((group) => group.groupId !== primaryGroup.groupId)
+  const expandableGroups = groups.filter(
+    (group) => group.groupId !== primaryGroup.groupId && !isEquivalentGroup(group, primaryGroup),
+  )
   const isPrimaryMarking = markingGroupIds.includes(primaryGroup.groupId)
+  const primaryGroupLabel = getGroupLabel(primaryGroup)
+
+  function renderGroupAccessAction(group: OfficialGroup, className: string) {
+    if (group.entry.type === 'qrcode') {
+      if (!group.entry.fallbackUrl) {
+        return null
+      }
+
+      return (
+        <a className={className} href={group.entry.fallbackUrl} rel="noreferrer" target="_blank">
+          打开入口
+        </a>
+      )
+    }
+
+    if (group.entry.type === 'qq_number') {
+      return (
+        <button
+          className={className}
+          onClick={() => void onCopyQQNumber('qqNumber' in group.entry ? group.entry.qqNumber : '')}
+          type="button"
+        >
+          复制群号
+        </button>
+      )
+    }
+
+    return (
+      <a className={className} href={group.entry.url} rel="noreferrer" target="_blank">
+        打开入口
+      </a>
+    )
+  }
 
   return (
     <article className="result-card panel section-intro" style={{ '--i': index + 2 } as React.CSSProperties}>
@@ -87,6 +150,10 @@ export function ResultCard({
         </div>
 
         <aside className="result-entry-pane" aria-label={`${card.appName} 群入口`}>
+          <div className="entry-meta">
+            <span className="entry-group-label">{primaryGroupLabel}</span>
+          </div>
+
           {primaryGroup.entry.type === 'qrcode' ? (
             <div className="entry-qr-shell">
               <img
@@ -103,15 +170,8 @@ export function ResultCard({
               ) : null}
             </div>
           ) : primaryGroup.entry.type === 'qq_number' ? (
-            <div className="entry-link-stack">
+            <div className="entry-link-stack qq-entry-stack">
               <span className="entry-qq-number">{'qqNumber' in primaryGroup.entry ? primaryGroup.entry.qqNumber : ''}</span>
-              <button
-                className="entry-link-button secondary"
-                onClick={() => void onCopyQQNumber('qqNumber' in primaryGroup.entry ? primaryGroup.entry.qqNumber : '')}
-                type="button"
-              >
-                复制群号
-              </button>
             </div>
           ) : (
             <div className="entry-link-stack">
@@ -124,43 +184,45 @@ export function ResultCard({
       </div>
 
       <div className="card-utility-row">
-        <button
-          className="mini-action aligned-action"
-          disabled={isPrimaryMarking}
-          onClick={() => void onMarkViewed(card, primaryGroup)}
-          type="button"
-        >
-          {isPrimaryMarking ? '处理中…' : '入库'}
-        </button>
-        <button
-          className="mini-action secondary-mark aligned-action"
-          disabled={isPrimaryMarking}
-          onClick={() => void onMarkIgnored(card, primaryGroup)}
-          type="button"
-        >
-          忽略
-        </button>
-        <div className="action-column action-column-right">
-          {secondaryGroups.length > 0 ? (
-            <button
-              aria-controls={`extra-groups-${card.productId}`}
-              aria-expanded={expanded}
-              className="expand-toggle"
-              onClick={() => onToggleExpanded(card.productId)}
-              type="button"
-            >
-              {expanded ? `收起其余 ${secondaryGroups.length} 个入口` : `展开其余 ${secondaryGroups.length} 个入口`}
-            </button>
-          ) : null}
+        <div className="card-action-strip">
+          {renderGroupAccessAction(primaryGroup, 'source-link compact-link inline-action access-action')}
+          <button
+            className="mini-action inline-action"
+            disabled={isPrimaryMarking}
+            onClick={() => void onMarkViewed(card, primaryGroup)}
+            type="button"
+          >
+            {isPrimaryMarking ? '处理中…' : '入库'}
+          </button>
+          <button
+            className="mini-action secondary-mark inline-action"
+            disabled={isPrimaryMarking}
+            onClick={() => void onMarkIgnored(card, primaryGroup)}
+            type="button"
+          >
+            忽略
+          </button>
         </div>
+
+        {expandableGroups.length > 0 ? (
+          <button
+            aria-controls={`extra-groups-${card.productId}`}
+            aria-expanded={expanded}
+            className="expand-toggle"
+            onClick={() => onToggleExpanded(card.productId)}
+            type="button"
+          >
+            {expanded ? `收起其余 ${expandableGroups.length} 个入口` : `展开其余 ${expandableGroups.length} 个入口`}
+          </button>
+        ) : null}
       </div>
 
-      {secondaryGroups.length > 0 ? (
+      {expandableGroups.length > 0 ? (
         <div className="group-expansion">
           <div className={`collapsible ${expanded ? 'open' : ''}`} id={`extra-groups-${card.productId}`}>
             <div className="collapsible-inner">
               <div className="secondary-group-list">
-                {secondaryGroups.map((group) => {
+                {expandableGroups.map((group) => {
                   const isMarking = markingGroupIds.includes(group.groupId)
 
                   return (
@@ -168,8 +230,8 @@ export function ResultCard({
                       <div className="secondary-group-main">
                         <div className="secondary-group-label">{getGroupLabel(group)}</div>
 
-                        <div className="secondary-group-content">
-                          {group.entry.type === 'qrcode' ? (
+                        {group.entry.type === 'qrcode' ? (
+                          <div className="secondary-group-content">
                             <div className="secondary-entry-cluster">
                               <img
                                 alt={`${card.appName} ${group.platform} 二维码`}
@@ -182,56 +244,37 @@ export function ResultCard({
                                 {group.entry.fallbackUrl ? '已抓取二维码' : '扫码进入'}
                               </span>
                             </div>
-                          ) : group.entry.type === 'qq_number' ? (
+                          </div>
+                        ) : group.entry.type === 'qq_number' ? (
+                          <div className="secondary-group-content">
                             <div className="secondary-entry-cluster">
-                              <span className="secondary-entry-text">{'qqNumber' in group.entry ? group.entry.qqNumber : ''}</span>
+                              <span className="secondary-entry-text secondary-qq-number">
+                                {'qqNumber' in group.entry ? group.entry.qqNumber : ''}
+                              </span>
                             </div>
-                          ) : (
-                            <div className="secondary-entry-cluster">
-                              <span className="secondary-entry-text">{group.entry.note}</span>
-                            </div>
-                          )}
-                        </div>
+                          </div>
+                        ) : null}
                       </div>
 
-                      <button
-                        className="mini-action secondary-mark aligned-action"
-                        disabled={isMarking}
-                        onClick={() => void onMarkViewed(card, group)}
-                        type="button"
-                      >
-                        {isMarking ? '处理中…' : '入库'}
-                      </button>
+                      <div className="secondary-group-actions">
+                        {renderGroupAccessAction(group, 'source-link compact-link inline-action access-action')}
+                        <button
+                          className="mini-action secondary-mark inline-action"
+                          disabled={isMarking}
+                          onClick={() => void onMarkViewed(card, group)}
+                          type="button"
+                        >
+                          {isMarking ? '处理中…' : '入库'}
+                        </button>
 
-                      <button
-                        className="mini-action secondary-mark aligned-action"
-                        disabled={isMarking}
-                        onClick={() => void onMarkIgnored(card, group)}
-                        type="button"
-                      >
-                        忽略
-                      </button>
-
-                      <div className="action-column action-column-right">
-                        {group.entry.type === 'qrcode' ? (
-                          group.entry.fallbackUrl ? (
-                            <a className="source-link compact-link" href={group.entry.fallbackUrl} rel="noreferrer" target="_blank">
-                              打开入口
-                            </a>
-                          ) : null
-                        ) : group.entry.type === 'qq_number' ? (
-                          <button
-                            className="source-link compact-link"
-                            onClick={() => void onCopyQQNumber('qqNumber' in group.entry ? group.entry.qqNumber : '')}
-                            type="button"
-                          >
-                            复制群号
-                          </button>
-                        ) : (
-                          <a className="source-link compact-link" href={group.entry.url} rel="noreferrer" target="_blank">
-                            打开入口
-                          </a>
-                        )}
+                        <button
+                          className="mini-action secondary-mark inline-action"
+                          disabled={isMarking}
+                          onClick={() => void onMarkIgnored(card, group)}
+                          type="button"
+                        >
+                          忽略
+                        </button>
                       </div>
                     </section>
                   )

@@ -591,7 +591,23 @@
   align-self: stretch;
   align-items: center;
   justify-items: center;
+  align-content: center;
+  gap: 12px;
   min-height: 100%;
+}
+
+.entry-meta {
+  display: grid;
+  gap: 6px;
+  width: 100%;
+  justify-items: center;
+}
+
+.entry-group-label {
+  font-size: 0.84rem;
+  font-weight: 700;
+  color: var(--accent-strong);
+  text-align: center;
 }
 
 .entry-qr-shell,
@@ -600,6 +616,10 @@
   gap: 10px;
   width: 100%;
   justify-items: center;
+}
+
+.qq-entry-stack {
+  gap: 4px;
 }
 
 .qrcode-image {
@@ -631,9 +651,12 @@
 }
 
 .entry-qq-number {
-  font-size: 1.12rem;
+  font-size: 1.06rem;
   font-weight: 700;
   letter-spacing: 0.02em;
+  line-height: 1.2;
+  text-align: center;
+  word-break: break-all;
   color: var(--heading);
 }
 
@@ -660,24 +683,26 @@
 }
 
 .card-utility-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 10px 14px;
+  flex-wrap: wrap;
   padding-top: 6px;
   border-top: 1px solid rgba(60, 74, 64, 0.08);
 }
 
-.card-utility-note {
-  font-size: 0.84rem;
-  font-weight: 700;
-  color: var(--accent-strong);
+.card-action-strip,
+.secondary-group-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
   min-width: 0;
 }
 
-.aligned-action {
-  min-width: 176px;
-  justify-self: end;
+.card-action-strip {
+  flex: 1 1 auto;
 }
 
 .mini-action,
@@ -706,6 +731,17 @@
   color: var(--heading);
 }
 
+.inline-action {
+  min-width: auto;
+  min-height: 34px;
+  padding-inline: 18px;
+  white-space: nowrap;
+}
+
+.access-action.compact-link {
+  min-width: auto;
+}
+
 .expand-toggle {
   border: none;
   background: transparent;
@@ -728,10 +764,6 @@
   display: grid;
   gap: 8px;
   min-width: 0;
-}
-
-.secondary-mark {
-  justify-self: end;
 }
 
 .group-expansion {
@@ -760,9 +792,9 @@
 
 .secondary-group-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  align-items: center;
-  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 14px;
   padding: 12px 0;
   border-top: 1px solid rgba(60, 74, 64, 0.08);
 }
@@ -792,6 +824,12 @@
 .secondary-entry-text {
   font-size: 0.82rem;
   color: var(--heading);
+}
+
+.secondary-qq-number {
+  font-size: 0.96rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
 }
 
 .compact-link {
@@ -1067,8 +1105,7 @@
   .recommendation-strip,
   .viewed-header,
   .viewed-app-header,
-  .viewed-group-head,
-  .card-utility-row {
+  .viewed-group-head {
     align-items: flex-start;
     flex-direction: column;
   }
@@ -1107,9 +1144,7 @@
   .link-button,
   .manual-actions button,
   .manual-upload-toggle,
-  .viewed-toggle,
-  .mini-action,
-  .expand-toggle {
+  .viewed-toggle {
     width: 100%;
   }
 
@@ -1139,27 +1174,28 @@
     justify-items: start;
   }
 
+  .entry-meta,
   .entry-qr-shell,
   .entry-link-stack {
     justify-items: start;
+  }
+
+  .entry-group-label {
+    text-align: left;
   }
 
   .secondary-group-row {
     gap: 10px;
   }
 
-  .secondary-mark {
-    justify-self: stretch;
+  .card-utility-row,
+  .card-action-strip,
+  .secondary-group-actions {
+    align-items: flex-start;
   }
 
-  .aligned-action {
+  .inline-action {
     min-width: 0;
-    justify-self: stretch;
-  }
-
-  .action-column-right {
-    justify-self: stretch;
-    justify-content: flex-start;
   }
 
   .secondary-entry-cluster,
